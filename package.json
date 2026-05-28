@@ -1,0 +1,25 @@
+{
+  "name": "circuit-indexer",
+  "version": "0.1.0",
+  "description": "Circuit Indexer — consumes Geyser event stream, parses pool state, writes to Redis + Postgres",
+  "main": "indexer.js",
+  "type": "commonjs",
+  "scripts": {
+    "start":   "node indexer.js",
+    "dev":     "node --watch indexer.js",
+    "stream":  "node indexer.js --consumer=file --file=/tmp/circuit-geyser.jsonl",
+    "grpc":    "node indexer.js --consumer=grpc"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "bs58":            "^6.0.0"
+  },
+  "optionalDependencies": {
+    "ioredis":         "^5.3.2",
+    "pg":              "^8.11.0",
+    "@triton-one/yellowstone-grpc": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
