@@ -1,18 +1,5 @@
-# Node dependencies
 node_modules/
-
-# Environment / secrets
+*.log
 .env
 .env.*
 !.env.example
-
-# Runtime data
-*.log
-pids/
-*.pid
-
-# Editor / OS
-.DS_Store
-.idea/
-.vscode/
-*.swp
