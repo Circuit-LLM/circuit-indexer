@@ -17,14 +17,17 @@ const Logger = require('../lib/logger');
 const DB_URL = process.env.DATABASE_URL || 'postgresql://localhost/circuit_index';
 
 let _pool = null;
+let _failed = false; // don't retry after first connection failure
 
 async function getPool() {
-  if (_pool) return _pool;
+  if (_pool)   return _pool;
+  if (_failed) return null;
   let pg;
   try {
     pg = require('pg');
   } catch {
     Logger.warn('PostgresWriter: pg not installed — running in no-op mode. npm install pg');
+    _failed = true;
     return null;
   }
   _pool = new pg.Pool({ connectionString: DB_URL });
@@ -35,7 +38,8 @@ async function getPool() {
     Logger.info('PostgresWriter: connected', { url: DB_URL });
   } catch (e) {
     Logger.warn('PostgresWriter: could not connect — no-op mode', { error: e.message });
-    _pool = null;
+    _pool  = null;
+    _failed = true;
   }
   return _pool;
 }

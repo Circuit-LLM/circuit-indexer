@@ -1,90 +1,71 @@
-// parsers/raydium.js — Parse Raydium AMM and CLMM pool account state.
+// parsers/raydium.js — Parse Raydium AMM v4 and CLMM pool account state.
 //
-// Two Raydium pool types:
+// Program IDs:
+//   AMM v4:  675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8
+//   CLMM:    CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
 //
-// 1. AMM v4 (constant-product): price = coin_reserve / pc_reserve
-//    Program: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8
-//    Account layout: AmmInfo (752 bytes)
+// AMM v4 (constant-product): price = pc_reserve / coin_reserve (decimal-adjusted)
+//   Account: AmmInfo, 752 bytes
 //
-// 2. CLMM (concentrated liquidity): price = sqrtPriceX64^2 / 2^128
-//    Program: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
-//    Account layout: PoolState (1544 bytes)
-//
-// We decode pool state from the raw account data delivered by the Geyser plugin.
-// The layouts are fixed — no RPC calls needed for price calculation.
+// CLMM (concentrated liquidity): price = (sqrtPriceX64 / 2^64)^2 × 10^(dec1-dec0)
+//   Account: PoolState, 1544 bytes
+//   Layout includes 1-byte `bump` field at offset 8 (after discriminator),
+//   which shifts all subsequent fields by 1 vs a naive discriminator-only layout.
 'use strict';
 
 const bs58 = require('bs58').default ?? require('bs58');
 
-const RAYDIUM_AMM_V4   = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
-const RAYDIUM_CLMM     = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
-const AMM_INFO_SIZE    = 752;
-const CLMM_POOL_SIZE   = 1544;
+const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+const RAYDIUM_CLMM   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
+
+const AMM_INFO_SIZE  = 752;
+const CLMM_POOL_SIZE = 1544;
 
 // ── AMM v4 — AmmInfo layout offsets ──────────────────────────────────────────
-// Reference: https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs
-// Key fields (byte offsets):
 const AMM = {
-  STATUS:           0,   // u64
-  NONCE:            8,   // u64
-  ORDER_NUM:        16,  // u64
-  DEPTH:            24,  // u64
-  COIN_DECIMALS:    32,  // u64
-  PC_DECIMALS:      40,  // u64
-  STATE:            48,  // u64
-  RESET_FLAG:       56,  // u64
-  MIN_SIZE:         64,  // u64
-  VOL_MAX_CUT_RATIO: 72, // u64
-  AMOUNT_WAVE:      80,  // u64
-  COIN_AMOUNT:      88,  // u64 — coin reserve (token A)
-  PC_AMOUNT:        96,  // u64 — pc reserve (token B = USDC/SOL)
-  COIN_MINT:        264, // Pubkey (32 bytes)
-  PC_MINT:          296, // Pubkey (32 bytes)
+  STATUS:        0,   // u64 — 6 = initialized pool
+  COIN_DECIMALS: 32,  // u64
+  PC_DECIMALS:   40,  // u64
+  COIN_AMOUNT:   88,  // u64 — coin vault reserve
+  PC_AMOUNT:     96,  // u64 — pc vault reserve
+  COIN_MINT:     264, // Pubkey (32 bytes)
+  PC_MINT:       296, // Pubkey (32 bytes)
 };
 
 // ── CLMM — PoolState layout offsets ──────────────────────────────────────────
-// Reference: https://github.com/raydium-io/raydium-clmm/blob/master/programs/amm/src/states/pool.rs
+// discriminator[8] + bump[1] + amm_config[32] + owner[32] = token_mint_0 at 73
 const CLMM = {
-  DISCRIMINATOR:    0,   // [u8; 8]
-  AMML_CONFIG:      8,   // Pubkey
-  POOL_CREATOR:     40,  // Pubkey
-  TOKEN_VAULT_0:    72,  // Pubkey
-  TOKEN_VAULT_1:    104, // Pubkey
-  OBSERVATION_KEY:  136, // Pubkey
-  MINT_DECIMALS_0:  168, // u8
-  MINT_DECIMALS_1:  169, // u8
-  TICK_SPACING:     170, // u16
-  LIQUIDITY:        172, // u128
-  SQRT_PRICE_X64:   188, // u128 — encoded price
-  TICK_CURRENT:     204, // i32
-  MINT_0:           289, // Pubkey (32 bytes)
-  MINT_1:           321, // Pubkey (32 bytes)
+  DISCRIMINATOR:   0,   // [u8; 8]
+  BUMP:            8,   // u8 — 1-byte bump shifts every subsequent field by 1
+  AMML_CONFIG:     9,   // Pubkey (32)
+  POOL_CREATOR:    41,  // Pubkey (32)
+  MINT_0:          73,  // Pubkey (32) — token_mint_0
+  MINT_1:          105, // Pubkey (32) — token_mint_1
+  TOKEN_VAULT_0:   137, // Pubkey (32)
+  TOKEN_VAULT_1:   169, // Pubkey (32)
+  OBSERVATION_KEY: 201, // Pubkey (32)
+  MINT_DECIMALS_0: 233, // u8
+  MINT_DECIMALS_1: 234, // u8
+  TICK_SPACING:    235, // u16
+  LIQUIDITY:       237, // u128 (16 bytes)
+  SQRT_PRICE_X64:  253, // u128 (16 bytes)
+  TICK_CURRENT:    269, // i32
 };
 
 // ── Price math ────────────────────────────────────────────────────────────────
 
-/**
- * AMM v4: price = pcAmount / coinAmount, adjusted for decimals.
- * This gives price of coin (token A) in terms of pc (token B, usually USDC or SOL).
- */
 function ammPrice(coinAmount, pcAmount, coinDecimals, pcDecimals) {
   if (coinAmount === 0n) return null;
   const priceRaw = Number(pcAmount) / Number(coinAmount);
   return priceRaw * Math.pow(10, Number(coinDecimals) - Number(pcDecimals));
 }
 
-/**
- * CLMM: price = (sqrtPriceX64 / 2^64)^2
- * Gives price of token0 in terms of token1.
- */
 function clmmPrice(sqrtPriceX64, decimals0, decimals1) {
-  // sqrtPriceX64 is a u128 stored as two u64s (little-endian)
-  // price = (sqrtPriceX64 / 2^64)^2 * 10^(decimals1 - decimals0)
-  const Q64 = 2n ** 64n;
-  const sqrt = sqrtPriceX64; // BigInt
-  const ratio = Number(sqrt) / Number(Q64);
-  const price = ratio * ratio * Math.pow(10, decimals1 - decimals0);
-  return price;
+  if (sqrtPriceX64 === 0n) return 0;
+  const Q64   = 2n ** 64n;
+  const ratio = Number(sqrtPriceX64) / Number(Q64);
+  // price = raw_1/raw_0 adjusted to human: multiply by 10^(dec0 - dec1)
+  return ratio * ratio * Math.pow(10, decimals0 - decimals1);
 }
 
 // ── Parsers ───────────────────────────────────────────────────────────────────
@@ -92,27 +73,29 @@ function clmmPrice(sqrtPriceX64, decimals0, decimals1) {
 function parseAmmV4(buf) {
   if (buf.length < AMM_INFO_SIZE) return null;
   try {
-    const coinAmount   = buf.readBigUInt64LE(AMM.COIN_AMOUNT);
-    const pcAmount     = buf.readBigUInt64LE(AMM.PC_AMOUNT);
+    const status = buf.readBigUInt64LE(AMM.STATUS);
+    // Only parse initialized pools (status == 6 or 7)
+    if (status !== 6n && status !== 7n) return null;
+
     const coinDecimals = buf.readBigUInt64LE(AMM.COIN_DECIMALS);
     const pcDecimals   = buf.readBigUInt64LE(AMM.PC_DECIMALS);
-    const status       = buf.readBigUInt64LE(AMM.STATUS);
-
-    const coinMint = bs58.encode(buf.slice(AMM.COIN_MINT, AMM.COIN_MINT + 32));
-    const pcMint   = bs58.encode(buf.slice(AMM.PC_MINT,   AMM.PC_MINT   + 32));
+    const coinAmount   = buf.readBigUInt64LE(AMM.COIN_AMOUNT);
+    const pcAmount     = buf.readBigUInt64LE(AMM.PC_AMOUNT);
+    const coinMint     = bs58.encode(buf.slice(AMM.COIN_MINT, AMM.COIN_MINT + 32));
+    const pcMint       = bs58.encode(buf.slice(AMM.PC_MINT,   AMM.PC_MINT   + 32));
 
     const price = ammPrice(coinAmount, pcAmount, coinDecimals, pcDecimals);
 
     return {
-      type:          'raydium-amm-v4',
+      type:         'raydium-amm-v4',
       coinMint,
       pcMint,
-      coinReserve:   coinAmount.toString(),
-      pcReserve:     pcAmount.toString(),
-      coinDecimals:  Number(coinDecimals),
-      pcDecimals:    Number(pcDecimals),
-      price,         // price of coinMint in pcMint units
-      status:        Number(status),
+      coinReserve:  coinAmount.toString(),
+      pcReserve:    pcAmount.toString(),
+      coinDecimals: Number(coinDecimals),
+      pcDecimals:   Number(pcDecimals),
+      price,
+      status:       Number(status),
     };
   } catch { return null; }
 }
@@ -123,14 +106,13 @@ function parseClmm(buf) {
     const decimals0 = buf.readUInt8(CLMM.MINT_DECIMALS_0);
     const decimals1 = buf.readUInt8(CLMM.MINT_DECIMALS_1);
 
-    // Read u128 as two u64s (little-endian)
-    const lo = buf.readBigUInt64LE(CLMM.SQRT_PRICE_X64);
-    const hi = buf.readBigUInt64LE(CLMM.SQRT_PRICE_X64 + 8);
-    const sqrtPriceX64 = lo | (hi << 64n);
+    const sqrt_lo      = buf.readBigUInt64LE(CLMM.SQRT_PRICE_X64);
+    const sqrt_hi      = buf.readBigUInt64LE(CLMM.SQRT_PRICE_X64 + 8);
+    const sqrtPriceX64 = sqrt_lo | (sqrt_hi << 64n);
 
-    const liquidity_lo = buf.readBigUInt64LE(CLMM.LIQUIDITY);
-    const liquidity_hi = buf.readBigUInt64LE(CLMM.LIQUIDITY + 8);
-    const liquidity    = liquidity_lo | (liquidity_hi << 64n);
+    const liq_lo    = buf.readBigUInt64LE(CLMM.LIQUIDITY);
+    const liq_hi    = buf.readBigUInt64LE(CLMM.LIQUIDITY + 8);
+    const liquidity = liq_lo | (liq_hi << 64n);
 
     const tickCurrent = buf.readInt32LE(CLMM.TICK_CURRENT);
     const tickSpacing = buf.readUInt16LE(CLMM.TICK_SPACING);
@@ -138,26 +120,30 @@ function parseClmm(buf) {
     const mint0 = bs58.encode(buf.slice(CLMM.MINT_0, CLMM.MINT_0 + 32));
     const mint1 = bs58.encode(buf.slice(CLMM.MINT_1, CLMM.MINT_1 + 32));
 
+    // Reject tick arrays and other non-pool CLMM accounts (all-zero mints, zero sqrtPrice)
+    const SYSTEM_PROGRAM = '11111111111111111111111111111111';
+    if (mint0 === SYSTEM_PROGRAM || mint1 === SYSTEM_PROGRAM) return null;
+    if (sqrtPriceX64 === 0n) return null;
+    if (tickSpacing === 0) return null;
+    if (decimals0 > 18 || decimals1 > 18) return null;
+
     const price = clmmPrice(sqrtPriceX64, decimals0, decimals1);
 
     return {
-      type:        'raydium-clmm',
+      type:         'raydium-clmm',
       mint0,
       mint1,
       decimals0,
       decimals1,
       sqrtPriceX64: sqrtPriceX64.toString(),
-      liquidity:   liquidity.toString(),
+      liquidity:    liquidity.toString(),
       tickCurrent,
       tickSpacing,
-      price,       // price of mint0 in mint1 units
+      price,
     };
   } catch { return null; }
 }
 
-/**
- * Process a Geyser account event — if it's a Raydium pool, decode and return pool state.
- */
 function processAccountEvent(event) {
   if (event.type !== 'account') return null;
 
@@ -167,27 +153,14 @@ function processAccountEvent(event) {
   } catch { return null; }
 
   let pool = null;
-
   if (event.owner === RAYDIUM_AMM_V4) {
     pool = parseAmmV4(buf);
   } else if (event.owner === RAYDIUM_CLMM) {
     pool = parseClmm(buf);
   }
-
   if (!pool) return null;
 
-  return {
-    poolAccount: event.pubkey,
-    slot:        event.slot,
-    ts:          event.ts,
-    ...pool,
-  };
+  return { poolAccount: event.pubkey, slot: event.slot, ts: event.ts, ...pool };
 }
 
-module.exports = {
-  processAccountEvent,
-  parseAmmV4,
-  parseClmm,
-  RAYDIUM_AMM_V4,
-  RAYDIUM_CLMM,
-};
+module.exports = { processAccountEvent, parseAmmV4, parseClmm, RAYDIUM_AMM_V4, RAYDIUM_CLMM };

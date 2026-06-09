@@ -1,10 +1,12 @@
 // writers/redis.js — Write hot price data to Redis.
 //
-// Three Redis data structures:
-//   circuit:price:{mint}        STRING  JSON price record, TTL 30s
-//   circuit:pool:{poolAccount}  STRING  JSON pool state, TTL 60s
-//   circuit:mint:{mint}         STRING  JSON mint metadata, no TTL (stable)
-//   circuit:trending          ZSET    score=volumeUsd5m, member=mint
+// Redis data structures:
+//   circuit:price:{mint}          STRING  JSON USD price record, TTL 30s (stable-quoted pools only)
+//   circuit:price-sol:{mint}      STRING  JSON SOL price record, TTL 30s (SOL-quoted pools)
+//   circuit:pool:{poolAccount}    STRING  JSON pool state, TTL 60s
+//   circuit:pool-by-mint:{mint}   STRING  poolAccount address, TTL 120s (reverse index)
+//   circuit:mint:{mint}           STRING  JSON mint metadata, no TTL (stable)
+//   circuit:trending              ZSET    score=volumeUsd5m, member=mint
 //
 // Requires Redis ≥ 6.2. Install: sudo apt-get install -y redis-server
 // This module is a no-op if Redis is not available.
@@ -12,9 +14,11 @@
 
 const Logger = require('../lib/logger');
 
-const PRICE_TTL   = 30;  // seconds
-const POOL_TTL    = 60;
-const TRENDING_WINDOW = 5 * 60 * 1000; // 5 minutes
+const PRICE_TTL        = 30;   // seconds — USD price records
+const PRICE_SOL_TTL    = 120;  // seconds — SOL price records (longer TTL: less-active pools may not update every 30s)
+const POOL_TTL         = 60;   // seconds — pool state
+const POOL_BY_MINT_TTL = 120;  // seconds — reverse index (more forgiving; pool accounts are stable)
+const TRENDING_WINDOW  = 5 * 60 * 1000; // 5 minutes
 
 let _client = null;
 
@@ -73,6 +77,25 @@ async function writeMint(mint, mintData) {
   }));
 }
 
+// SOL-quoted price: priceSol = SOL per 1 UI token (decimal-adjusted).
+// Written for any pool where one side is SOL — this is what circuit-agents consume.
+// extraFields may include: poolAccount, coinReserve, pcReserve, coinDecimals, pcDecimals
+async function writePriceSol(mint, priceSol, source, extraFields = {}) {
+  const r = await getClient();
+  if (!r) return;
+  const record = { mint, priceSol, source, ts: Date.now(), ...extraFields };
+  await r.setex(`circuit:price-sol:${mint}`, PRICE_SOL_TTL, JSON.stringify(record));
+}
+
+// Reverse index: mint → pool account address.
+// Allows price-feed to resolve a mint to its pool without scanning all pool keys.
+// Also written for Pump.fun tokens registered via circuit-price-feed /register endpoint.
+async function writePoolByMint(mint, poolAccount) {
+  const r = await getClient();
+  if (!r) return;
+  await r.setex(`circuit:pool-by-mint:${mint}`, POOL_BY_MINT_TTL, poolAccount);
+}
+
 async function updateTrending(mint, volumeUsdDelta) {
   const r = await getClient();
   if (!r) return;
@@ -80,7 +103,7 @@ async function updateTrending(mint, volumeUsdDelta) {
   await r.zincrby('circuit:trending', volumeUsdDelta, mint);
 }
 
-// ── Read operations (for circuit-data-api onchain drivers) ─────────────────────
+// ── Read operations ───────────────────────────────────────────────────────────
 
 async function getPrice(mint) {
   const r = await getClient();
@@ -89,11 +112,24 @@ async function getPrice(mint) {
   return raw ? JSON.parse(raw) : null;
 }
 
+async function getPriceSol(mint) {
+  const r = await getClient();
+  if (!r) return null;
+  const raw = await r.get(`circuit:price-sol:${mint}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
 async function getPool(poolAccount) {
   const r = await getClient();
   if (!r) return null;
   const raw = await r.get(`circuit:pool:${poolAccount}`);
   return raw ? JSON.parse(raw) : null;
+}
+
+async function getPoolByMint(mint) {
+  const r = await getClient();
+  if (!r) return null;
+  return await r.get(`circuit:pool-by-mint:${mint}`);
 }
 
 async function getMint(mint) {
@@ -106,7 +142,6 @@ async function getMint(mint) {
 async function getTrending(limit = 20) {
   const r = await getClient();
   if (!r) return [];
-  // Highest volume first
   const raw = await r.zrevrange('circuit:trending', 0, limit - 1, 'WITHSCORES');
   const out = [];
   for (let i = 0; i < raw.length; i += 2) {
@@ -120,7 +155,7 @@ async function disconnect() {
 }
 
 module.exports = {
-  writePrice, writePool, writeMint, updateTrending,
-  getPrice, getPool, getMint, getTrending,
+  writePrice, writePriceSol, writePool, writePoolByMint, writeMint, updateTrending,
+  getPrice, getPriceSol, getPool, getPoolByMint, getMint, getTrending,
   disconnect,
 };

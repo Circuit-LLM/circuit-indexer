@@ -20,12 +20,15 @@
 
 const Logger = require('../lib/logger');
 
-// Well-known program IDs to subscribe to
+// Well-known program IDs to subscribe to.
+// NOTE: Raydium AMM v4 (675kPX9...) removed — vault balances aren't in account
+// data so price is always null, producing only garbage pool records in Redis.
 const WATCHED_PROGRAMS = [
-  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM v4
   'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
+  'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', // Raydium CPMM
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',  // Orca Whirlpools
   'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',  // Meteora DLMM
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',  // Pump.fun bonding curve
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',  // Token Program
   'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',  // Token-2022
 ];
@@ -35,10 +38,12 @@ class GrpcConsumer {
    * @param {function} onEvent - called with normalized Geyser event
    */
   constructor(onEvent) {
-    this._onEvent  = onEvent;
-    this._client   = null;
-    this._stream   = null;
-    this._running  = false;
+    this._onEvent       = onEvent;
+    this._client        = null;
+    this._stream        = null;
+    this._running       = false;
+    this._reconnecting  = false;  // guard: prevents concurrent reconnect timers
+    this._reconnectTimer = null;  // current pending reconnect timer
     this._stats    = { events: 0, reconnects: 0, errors: 0, lastEventTs: null };
   }
 
@@ -47,7 +52,8 @@ class GrpcConsumer {
 
     let Client;
     try {
-      ({ default: Client } = await import('@triton-one/yellowstone-grpc'));
+      const ygModule = require('@triton-one/yellowstone-grpc');
+      Client = ygModule.default ?? ygModule;
     } catch {
       throw new Error(
         'yellowstone-grpc not installed. Run: npm install @triton-one/yellowstone-grpc\n' +
@@ -105,6 +111,8 @@ class GrpcConsumer {
         stream.write(subscribeRequest, (err) => err ? reject(err) : resolve());
       });
 
+      // Successful subscription — reset reconnect counter so backoff starts fresh
+      this._stats.reconnects = 0;
       Logger.info('GrpcConsumer: subscribed', {
         programs: WATCHED_PROGRAMS.length,
       });
@@ -116,9 +124,8 @@ class GrpcConsumer {
   }
 
   _buildSubscribeRequest() {
-    // Subscribe to account updates for watched programs + all transactions
-    // yellowstone-grpc subscription format
-    return {
+    const { SubscribeRequest } = require('@triton-one/yellowstone-grpc/dist/grpc/geyser');
+    return SubscribeRequest.fromPartial({
       accounts: {
         circuit: {
           account: [],
@@ -128,21 +135,19 @@ class GrpcConsumer {
       },
       transactions: {
         circuit: {
-          vote:              false, // skip vote transactions
-          failed:            false, // skip failed transactions
-          signature:         null,
-          accountInclude:    WATCHED_PROGRAMS,
-          accountExclude:    [],
-          accountRequired:   [],
+          vote:            false,
+          failed:          false,
+          accountInclude:  WATCHED_PROGRAMS,
+          accountExclude:  [],
+          accountRequired: [],
         },
       },
-      slots:  { circuit: {} },
-      blocks: {},
-      blocksMeta: {},
-      commitment: 1, // Confirmed
+      slots:             { circuit: {} },
+      blocks:            {},
+      blocksMeta:        {},
+      commitment:        1, // Confirmed
       accountsDataSlice: [],
-      ping: null,
-    };
+    });
   }
 
   _handleGrpcEvent(data) {
@@ -191,25 +196,55 @@ class GrpcConsumer {
       });
 
     } else if (data.ping) {
-      // Keepalive ping — respond with pong
+      // Keepalive ping — respond with pong (write() takes a callback, not a Promise)
       if (this._stream) {
-        this._stream.write({ pong: { id: data.ping.id } }).catch(() => {});
+        const { SubscribeRequest } = require('@triton-one/yellowstone-grpc/dist/grpc/geyser');
+        const pong = SubscribeRequest.fromPartial({ ping: { id: data.ping.id } });
+        this._stream.write(pong, (err) => {
+          if (err) Logger.warn('GrpcConsumer: pong write failed', { error: err.message });
+        });
       }
     }
   }
 
   _reconnect() {
     if (!this._running) return;
+
+    // Guard: only one reconnect timer at a time.
+    // Without this, each "error" + "end" event pair (and any catch block)
+    // spawns its own setTimeout, causing an exponential timer storm that
+    // fills the event loop and leaks hundreds of MB of closure memory.
+    if (this._reconnecting) return;
+    this._reconnecting = true;
+
+    // Close current stream cleanly before scheduling reconnect
+    if (this._stream) {
+      try { this._stream.cancel?.(); this._stream.end?.(); } catch {}
+      this._stream = null;
+    }
+
     this._stats.reconnects++;
-    const delay = Math.min(5000 * this._stats.reconnects, 60_000);
-    Logger.info('GrpcConsumer: reconnecting', { delay, attempt: this._stats.reconnects });
-    setTimeout(() => this._subscribe(), delay);
+    // Exponential backoff capped at 60s. Use a separate attempt counter
+    // that resets to 0 on successful connection so backoff doesn't grow forever.
+    const attempt = this._stats.reconnects;
+    const delay   = Math.min(1000 * Math.pow(2, Math.min(attempt - 1, 6)), 60_000);
+    Logger.info('GrpcConsumer: reconnecting', { delay, attempt });
+
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnecting  = false;
+      this._reconnectTimer = null;
+      this._subscribe();
+    }, delay);
   }
 
   stop() {
     this._running = false;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this._stream) {
-      this._stream.end();
+      try { this._stream.cancel?.(); this._stream.end?.(); } catch {}
       this._stream = null;
     }
   }
