@@ -1,7 +1,7 @@
 {
   "name": "circuit-indexer",
-  "version": "0.1.0",
-  "description": "Circuit Indexer — consumes Geyser event stream, parses pool state, writes to Redis + Postgres",
+  "version": "0.7.0",
+  "description": "Circuit Indexer — consumes Geyser event stream, parses Raydium/Orca/PumpSwap pool state and swap transactions, writes real-time OHLCV candles to Redis",
   "main": "indexer.js",
   "type": "commonjs",
   "scripts": {

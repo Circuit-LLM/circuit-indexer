@@ -1,13 +1,14 @@
 # circuit-indexer
 
-Consumes a Geyser event stream from the Solana blockchain, parses Raydium and Orca pool state, and writes hot price data to Redis and historical OHLCV data to Postgres. Part of the Circuit data infrastructure stack.
+Consumes a Geyser event stream from the Solana blockchain, parses Raydium, Orca, and PumpSwap pool state, and writes real-time price data to Redis with OHLCV candles. Part of the Circuit data infrastructure stack.
 
 ## What it does
 
-- **Parses** Raydium AMM v4, Raydium CLMM, and Orca Whirlpool pool account updates into structured price/pool records
+- **Parses** Raydium AMM v4, Raydium CLMM, Orca Whirlpool, and PumpSwap pool account updates into structured price/pool records
+- **Tracks swap transactions** — extracts buy/sell direction and SOL volume from token balance deltas, fires into OHLCV aggregator with accurate b/s counts
 - **Tracks** token mint metadata (decimals, supply, authorities)
-- **Writes hot data** to Redis with short TTLs for low-latency reads by circuit-node
-- **Writes historical data** to Postgres: pool state, token records, and 1m/5m OHLCV candles
+- **Writes hot data** to Redis with short TTLs for low-latency reads by circuit-price-feed
+- **Writes OHLCV candles** to Redis ring buffers (1m/5m/1h/1d) with buy/sell counts — consumed by the scan route for on-chain dip discovery
 - **Three input modes**: file (from circuit-geyser), stdin (piped from test-validator), or gRPC (managed Geyser endpoint)
 
 ## How it fits in the Circuit stack
@@ -18,13 +19,15 @@ Consumes a Geyser event stream from the Solana blockchain, parses Raydium and Or
      └──────────────┬───────────────────┘
                     ▼
             circuit-indexer
-            ├─ Redis: circuit:price:{mint}    (TTL 30s)
-            ├─ Redis: circuit:pool:{account}  (TTL 60s)
-            ├─ Redis: circuit:mint:{mint}     (no TTL)
-            ├─ Redis: circuit:trending        (ZSET, 5m volume)
-            └─ Postgres: pools, tokens, candles
+            ├─ Redis: circuit:price-sol:{mint}         (TTL 120s)
+            ├─ Redis: circuit:pool:{account}           (TTL 60s)
+            ├─ Redis: circuit:pool-by-mint:{mint}      (TTL 120s)
+            ├─ Redis: circuit:mint:{mint}              (no TTL)
+            ├─ Redis: circuit:trending                 (ZSET, delta swap volume)
+            ├─ Redis: circuit:candles:{window}:{mint}  (ring buffer, 1m/5m/1h/1d)
+            └─ Redis: circuit:ph:{mint}                (price history ticks, TTL 24h)
                     ▼
-            circuit-node (reads Redis + Postgres to serve API)
+            circuit-price-feed (serves /price, /candles, /losers, /trending)
 ```
 
 ## Prerequisites
@@ -142,6 +145,7 @@ open, high, low, close, volume, trades
 | Raydium AMM v4 | `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` | `parsers/raydium.js` |
 | Raydium CLMM | `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK` | `parsers/raydium.js` |
 | Orca Whirlpools | `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` | `parsers/orca.js` |
+| PumpSwap | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | `parsers/pumpswap.js` |
 
 Additional DEX parsers can be added by implementing the `processAccountEvent(event)` interface in `parsers/`.
 
