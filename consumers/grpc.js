@@ -29,6 +29,7 @@ const WATCHED_PROGRAMS = [
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',  // Orca Whirlpools
   'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',  // Meteora DLMM
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',  // Pump.fun bonding curve
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',  // PumpSwap AMM
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',  // Token Program
   'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',  // Token-2022
 ];
@@ -176,11 +177,25 @@ class GrpcConsumer {
       if (!tx) return;
 
       const accounts = (tx.transaction?.message?.accountKeys ?? []).map(_tob58);
+      const preTokenBalances  = (tx.meta?.preTokenBalances  ?? []).map(b => ({
+        accountIndex: b.accountIndex,
+        mint:         b.mint,
+        owner:        b.owner,
+        amount:       b.uiTokenAmount?.amount ?? '0',
+      }));
+      const postTokenBalances = (tx.meta?.postTokenBalances ?? []).map(b => ({
+        accountIndex: b.accountIndex,
+        mint:         b.mint,
+        owner:        b.owner,
+        amount:       b.uiTokenAmount?.amount ?? '0',
+      }));
       const event = {
         type:      'transaction',
         signature: _tob58(data.transaction.signature),
         slot:      Number(data.transaction.slot),
         accounts,
+        preTokenBalances,
+        postTokenBalances,
         fee:       Number(tx.meta?.fee ?? 0),
         success:   !tx.meta?.err,
         ts:        Date.now(),

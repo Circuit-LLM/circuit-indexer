@@ -2,11 +2,19 @@
 //
 // Redis data structures:
 //   circuit:price:{mint}          STRING  JSON USD price record, TTL 30s (stable-quoted pools only)
-//   circuit:price-sol:{mint}      STRING  JSON SOL price record, TTL 30s (SOL-quoted pools)
+//   circuit:price-sol:{mint}      STRING  JSON SOL price record, TTL 120s (SOL-quoted pools)
 //   circuit:pool:{poolAccount}    STRING  JSON pool state, TTL 60s
 //   circuit:pool-by-mint:{mint}   STRING  poolAccount address, TTL 120s (reverse index)
 //   circuit:mint:{mint}           STRING  JSON mint metadata, no TTL (stable)
-//   circuit:trending              ZSET    score=volumeUsd5m, member=mint
+//   circuit:trending              ZSET    score=accumulated volume (SOL), member=mint
+//   circuit:ph:{mint}             LIST    price history ring buffer, max 300 entries, TTL 24h
+//                                         each entry: JSON {p, ts} (priceSol, unix ms)
+//   circuit:candles:1m:{mint}     LIST    1m OHLCV ring buffer, max 120 candles (~2h), TTL 4h
+//   circuit:candles:5m:{mint}     LIST    5m OHLCV ring buffer, max 288 candles (~24h), TTL 36h
+//   circuit:candles:1h:{mint}     LIST    1h OHLCV ring buffer, max 168 candles (~7d), TTL 8d
+//   circuit:candles:1d:{mint}     LIST    1d OHLCV ring buffer, max 90 candles (~90d), TTL 92d
+//                                         each entry: JSON {t, o, h, l, c, v, n, b, s}
+//                                           t=openTime ms, o/h/l/c=OHLCV, n=ticks, b=buys, s=sells
 //
 // Requires Redis ≥ 6.2. Install: sudo apt-get install -y redis-server
 // This module is a no-op if Redis is not available.
@@ -14,11 +22,22 @@
 
 const Logger = require('../lib/logger');
 
-const PRICE_TTL        = 30;   // seconds — USD price records
-const PRICE_SOL_TTL    = 120;  // seconds — SOL price records (longer TTL: less-active pools may not update every 30s)
-const POOL_TTL         = 60;   // seconds — pool state
-const POOL_BY_MINT_TTL = 120;  // seconds — reverse index (more forgiving; pool accounts are stable)
-const TRENDING_WINDOW  = 5 * 60 * 1000; // 5 minutes
+const PRICE_TTL        = 30;    // seconds — USD price records
+const PRICE_SOL_TTL    = 120;   // seconds — SOL price records
+const POOL_TTL         = 60;    // seconds — pool state
+const POOL_BY_MINT_TTL = 120;   // seconds — reverse index
+
+// Price history ring buffer config
+const PH_MAX_ENTRIES   = 300;   // ~5 min at 1 tick/sec for active pools
+const PH_TTL           = 86400; // 24h TTL
+
+// Candle ring buffer config (max entries per window, TTL seconds)
+const CANDLE_CFG = {
+  '1m': { max: 120, ttl: 4   * 3600 },
+  '5m': { max: 288, ttl: 36  * 3600 },
+  '1h': { max: 168, ttl: 8   * 86400 },
+  '1d': { max: 90,  ttl: 92  * 86400 },
+};
 
 let _client = null;
 
@@ -96,11 +115,50 @@ async function writePoolByMint(mint, poolAccount) {
   await r.setex(`circuit:pool-by-mint:${mint}`, POOL_BY_MINT_TTL, poolAccount);
 }
 
-async function updateTrending(mint, volumeUsdDelta) {
+async function updateTrending(mint, volumeSolDelta) {
   const r = await getClient();
   if (!r) return;
-  // ZINCRBY — increment score (5m volume) for this mint
-  await r.zincrby('circuit:trending', volumeUsdDelta, mint);
+  await r.zincrby('circuit:trending', volumeSolDelta, mint);
+}
+
+// Append a single price tick to the per-mint price history ring buffer.
+// Called by indexer every time writePriceSol produces a fresh price.
+async function appendPriceHistory(mint, priceSol, ts) {
+  const r = await getClient();
+  if (!r) return;
+  const key    = `circuit:ph:${mint}`;
+  const entry  = JSON.stringify({ p: priceSol, ts });
+  const pipe   = r.pipeline();
+  pipe.lpush(key, entry);
+  pipe.ltrim(key, 0, PH_MAX_ENTRIES - 1);
+  pipe.expire(key, PH_TTL);
+  await pipe.exec();
+}
+
+// Write a completed OHLCV candle to the per-mint ring buffer for the given window.
+// Called from the indexer's onCandle callback.
+async function writeCandleBuffer(candle) {
+  const cfg = CANDLE_CFG[candle.window];
+  if (!cfg) return; // unsupported window
+  const r = await getClient();
+  if (!r) return;
+  const key   = `circuit:candles:${candle.window}:${candle.mint}`;
+  const entry = JSON.stringify({
+    t: candle.openTime,
+    o: candle.open,
+    h: candle.high,
+    l: candle.low,
+    c: candle.close,
+    v: candle.volume,
+    n: candle.ticks,
+    b: candle.buys  ?? 0,
+    s: candle.sells ?? 0,
+  });
+  const pipe  = r.pipeline();
+  pipe.lpush(key, entry);
+  pipe.ltrim(key, 0, cfg.max - 1);
+  pipe.expire(key, cfg.ttl);
+  await pipe.exec();
 }
 
 // ── Read operations ───────────────────────────────────────────────────────────
@@ -145,9 +203,33 @@ async function getTrending(limit = 20) {
   const raw = await r.zrevrange('circuit:trending', 0, limit - 1, 'WITHSCORES');
   const out = [];
   for (let i = 0; i < raw.length; i += 2) {
-    out.push({ mint: raw[i], volumeUsd5m: parseFloat(raw[i + 1]) });
+    out.push({ mint: raw[i], volumeSol: parseFloat(raw[i + 1]) });
   }
   return out;
+}
+
+// Returns price history for a mint as [{p, ts}, ...] oldest-first, up to `limit` entries.
+async function getPriceHistory(mint, limit = 100) {
+  const r = await getClient();
+  if (!r) return [];
+  const raw = await r.lrange(`circuit:ph:${mint}`, 0, limit - 1);
+  // LPUSH stores newest first; reverse to return oldest-first
+  return raw.map(e => { try { return JSON.parse(e); } catch { return null; } })
+            .filter(Boolean)
+            .reverse();
+}
+
+// Returns candle ring buffer for a mint+window, oldest-first, up to `limit` candles.
+async function getCandles(mint, window, limit = 100) {
+  const cfg = CANDLE_CFG[window];
+  if (!cfg) return [];
+  const r = await getClient();
+  if (!r) return [];
+  const cap = Math.min(limit, cfg.max);
+  const raw = await r.lrange(`circuit:candles:${window}:${mint}`, 0, cap - 1);
+  return raw.map(e => { try { return JSON.parse(e); } catch { return null; } })
+            .filter(Boolean)
+            .reverse();
 }
 
 async function disconnect() {
@@ -155,7 +237,9 @@ async function disconnect() {
 }
 
 module.exports = {
-  writePrice, writePriceSol, writePool, writePoolByMint, writeMint, updateTrending,
-  getPrice, getPriceSol, getPool, getPoolByMint, getMint, getTrending,
+  writePrice, writePriceSol, writePool, writePoolByMint, writeMint,
+  updateTrending, appendPriceHistory, writeCandleBuffer,
+  getPrice, getPriceSol, getPool, getPoolByMint, getMint,
+  getTrending, getPriceHistory, getCandles,
   disconnect,
 };

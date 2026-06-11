@@ -24,6 +24,7 @@ const bs58       = require('bs58').default ?? require('bs58');
 const raydium    = require('./parsers/raydium');
 const orca       = require('./parsers/orca');
 const cpmm       = require('./parsers/cpmm');
+const pumpswap   = require('./parsers/pumpswap');
 const pumpfun    = require('./parsers/pumpfun');
 const token      = require('./parsers/token');
 const redis      = require('./writers/redis');
@@ -66,6 +67,8 @@ const ohlcv = new OHLCVAggregator(async (candle) => {
   } catch (e) {
     Logger.error('Failed to write candle', { error: e.message });
   }
+  // Also persist to Redis ring buffer — readable by circuit-price-feed without Postgres
+  redis.writeCandleBuffer(candle).catch(() => {});
 });
 
 // Evict OHLCV buckets for tokens that stopped trading > 2h ago.
@@ -96,6 +99,14 @@ const decimalsMap = new Map([
   ['DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', 5],  // BONK
   ['JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',  6],  // JUP
 ]);
+
+// Wrap redis.writePriceSol to also append to the price-history ring buffer.
+// Keeps all call sites clean — no change needed elsewhere in this file.
+const _writePriceSol = redis.writePriceSol.bind(redis);
+redis.writePriceSol = async function(mint, priceSol, source, extraFields = {}) {
+  await _writePriceSol(mint, priceSol, source, extraFields);
+  redis.appendPriceHistory(mint, priceSol, Date.now()).catch(() => {});
+};
 
 // CPMM vault registry: vault_pubkey → { poolAccount, isVault0, mint0, mint1, dec0, dec1 }
 // Populated when we see CPMM pool state accounts; used to compute price on vault updates.
@@ -189,7 +200,15 @@ async function handleAccount(event) {
         // Unusual: SOL is the "coin" side. price = pcAmount/coinAmount = TOKEN per SOL → invert.
         const priceSol = 1 / poolR.price;
         if (isFinite(priceSol) && priceSol > 0) {
-          await redis.writePriceSol(quoteMint, priceSol, poolR.type, { poolAccount: event.pubkey });
+          // Swap labels: coinMint=SOL so coinReserve is the SOL vault, pcReserve is the token vault.
+          // Downstream convention: coinReserve=token side, pcReserve=SOL side — swap here.
+          await redis.writePriceSol(quoteMint, priceSol, poolR.type, {
+            poolAccount:  event.pubkey,
+            coinReserve:  poolR.pcReserve,    // token side (pcMint = quoteMint = token)
+            pcReserve:    poolR.coinReserve,  // SOL side (coinMint = SOL)
+            coinDecimals: poolR.pcDecimals,
+            pcDecimals:   poolR.coinDecimals, // 9
+          });
           await redis.writePoolByMint(quoteMint, event.pubkey);
         }
       }
@@ -270,10 +289,35 @@ async function handleAccount(event) {
     // Register vaults so we can compute price when vault balances arrive
     const dec0 = poolC.dec0 ?? decimalsMap.get(poolC.mint0) ?? null;
     const dec1 = poolC.dec1 ?? decimalsMap.get(poolC.mint1) ?? null;
-    const entry = { poolAccount: event.pubkey, mint0: poolC.mint0, mint1: poolC.mint1, dec0, dec1 };
-    vaultRegistry.set(poolC.vault0, { ...entry, isVault0: true  });
-    vaultRegistry.set(poolC.vault1, { ...entry, isVault0: false });
+    const entry = { poolAccount: event.pubkey, mint0: poolC.mint0, mint1: poolC.mint1, dec0, dec1, poolType: 'raydium-cpmm' };
+    vaultRegistry.set(poolC.vault0, { ...entry, isVault0: true,  pairedVault: poolC.vault1 });
+    vaultRegistry.set(poolC.vault1, { ...entry, isVault0: false, pairedVault: poolC.vault0 });
     await redis.writePool(event.pubkey, poolC);
+    return;
+  }
+
+  // ── Try PumpSwap AMM ─────────────────────────────────────────────────────
+  const poolPS = pumpswap.processAccountEvent(event);
+  if (poolPS) {
+    stats.pools++;
+    // base_mint decimals not in pool — fetch via RPC if not already cached
+    if (!decimalsMap.has(poolPS.baseMint)) {
+      await _fetchAndCacheDecimals([poolPS.baseMint]);
+    }
+    const decBase  = decimalsMap.get(poolPS.baseMint) ?? null;
+    const decQuote = decimalsMap.get(poolPS.quoteMint) ?? 9; // WSOL = 9
+    const entry = {
+      poolAccount: event.pubkey,
+      mint0: poolPS.baseMint,
+      mint1: poolPS.quoteMint,
+      dec0:  decBase,
+      dec1:  decQuote,
+      poolType: 'pumpswap',
+    };
+    vaultRegistry.set(poolPS.baseVault,  { ...entry, isVault0: true,  pairedVault: poolPS.quoteVault });
+    vaultRegistry.set(poolPS.quoteVault, { ...entry, isVault0: false, pairedVault: poolPS.baseVault  });
+    await redis.writePool(event.pubkey, { ...poolPS, poolType: 'pumpswap' });
+    await redis.writePoolByMint(poolPS.baseMint, event.pubkey);
     return;
   }
 
@@ -310,12 +354,13 @@ async function handleAccount(event) {
               updated.price = human1 / human0;
               if (updated.price > 0 && isFinite(updated.price)) {
                 // updated.price = human1/human0 = mint1 per mint0 (decimal-adjusted)
+                const src = reg.poolType || 'raydium-cpmm';
                 if (_isUsdQuote(reg.mint1)) {
-                  await redis.writePrice(reg.mint0, updated.price, 'raydium-cpmm');
+                  await redis.writePrice(reg.mint0, updated.price, src);
                   ohlcv.tick(reg.mint0, updated.price, 0, event.ts);
                 } else if (reg.mint1 === SOL_MINT) {
                   // mint1=SOL: price = SOL per mint0 — direct
-                  await redis.writePriceSol(reg.mint0, updated.price, 'raydium-cpmm', {
+                  await redis.writePriceSol(reg.mint0, updated.price, src, {
                     poolAccount:  reg.poolAccount,
                     coinReserve:  amt0,
                     pcReserve:    amt1,
@@ -327,7 +372,13 @@ async function handleAccount(event) {
                   // mint0=SOL: price = mint1 per SOL → invert
                   const priceSol = 1 / updated.price;
                   if (isFinite(priceSol) && priceSol > 0) {
-                    await redis.writePriceSol(reg.mint1, priceSol, 'raydium-cpmm', { poolAccount: reg.poolAccount });
+                    await redis.writePriceSol(reg.mint1, priceSol, src, {
+                      poolAccount:  reg.poolAccount,
+                      coinReserve:  amt1,
+                      pcReserve:    amt0,
+                      coinDecimals: reg.dec1,
+                      pcDecimals:   reg.dec0,
+                    });
                     await redis.writePoolByMint(reg.mint1, reg.poolAccount);
                   }
                 }
@@ -370,9 +421,55 @@ async function handleAccount(event) {
 
 async function handleTransaction(event) {
   stats.transactions++;
-  // Transaction volume tracking: increment trending score for mints in tx
-  // We'll do a simple heuristic — count the tx as volume for any watched pool
-  // Real volume needs pre/post token balance parsing (done in Phase 2)
+  if (!event.success) return;
+
+  const { preTokenBalances, postTokenBalances, accounts } = event;
+  if (!accounts?.length || !preTokenBalances?.length || !postTokenBalances?.length) return;
+
+  // Build pubkey → amount maps from accountIndex lookups
+  const preMap  = new Map();
+  const postMap = new Map();
+  for (const b of preTokenBalances) {
+    const pk = accounts[b.accountIndex];
+    if (pk) preMap.set(pk, BigInt(b.amount || '0'));
+  }
+  for (const b of postTokenBalances) {
+    const pk = accounts[b.accountIndex];
+    if (pk) postMap.set(pk, BigInt(b.amount || '0'));
+  }
+
+  // Check each account in this transaction against vaultRegistry.
+  // Only process base vaults (isVault0 = true) to avoid double-counting per swap.
+  for (const pk of postMap.keys()) {
+    const reg = vaultRegistry.get(pk);
+    if (!reg || !reg.isVault0) continue;
+
+    const preAmt  = preMap.get(pk) ?? 0n;
+    const postAmt = postMap.get(pk);
+    if (preAmt === postAmt) continue;
+
+    // Base vault decreased → tokens flowed to buyer (BUY); increased → SELL
+    const isBuy = postAmt < preAmt;
+
+    // Compute SOL volume from paired quote vault (WSOL) delta
+    let volumeSol = 0;
+    if (reg.pairedVault) {
+      const quotePre  = preMap.get(reg.pairedVault)  ?? 0n;
+      const quotePost = postMap.get(reg.pairedVault);
+      if (quotePost !== undefined && quotePost !== quotePre) {
+        const quoteDelta = quotePost > quotePre ? quotePost - quotePre : quotePre - quotePost;
+        volumeSol = Number(quoteDelta) / 1e9;
+      }
+    }
+
+    // Get current price for the OHLCV tick
+    const poolData = await redis.getPool(reg.poolAccount);
+    const price    = poolData?.price;
+    if (!price || price <= 0 || !isFinite(price)) continue;
+
+    ohlcv.tick(reg.mint0, price, volumeSol, event.ts, isBuy);
+    if (volumeSol > 0) redis.updateTrending(reg.mint0, volumeSol).catch(() => {});
+  }
 }
 
 // ── Consumer setup ────────────────────────────────────────────────────────────
