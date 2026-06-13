@@ -1,22 +1,21 @@
 // writers/postgres.js — Write OHLCV candles and token metadata to Postgres.
 //
-// Uses TimescaleDB extension for time-series hypertables on ohlcv_candles.
-// Falls back to regular Postgres if TimescaleDB is not installed.
+// Schema (plain Postgres, no TimescaleDB required):
+//   tokens       (mint, symbol, name, decimals, token_program, ...)
+//   pools        (pool_account, pool_type, mint_a, mint_b, ...)
+//   ohlcv_candles(time, mint, tf, open, high, low, close, volume, ticks, buys, sells)
 //
-// Schema:
-//   tokens (mint, symbol, name, decimals, token_program, first_seen_slot, first_seen_at)
-//   pools  (pool_account, type, mint_a, mint_b, program, first_seen_slot, first_seen_at)
-//   ohlcv_candles (time, mint, window, open, high, low, close, volume, ticks)
+// Column "tf" (timeframe) replaces "window" which is a PG16 reserved word.
+// Data retention is handled externally by a systemd timer (circuit-candle-retention.service).
 //
-// Requires: npm install pg && sudo apt-get install -y postgresql
-// This module is a no-op if Postgres is not available.
+// No-op if Postgres is unavailable — indexer runs fine without it.
 'use strict';
 
 const Logger = require('../lib/logger');
 
 const DB_URL = process.env.DATABASE_URL || 'postgresql://localhost/circuit_index';
 
-let _pool = null;
+let _pool   = null;
 let _failed = false; // don't retry after first connection failure
 
 async function getPool() {
@@ -26,11 +25,11 @@ async function getPool() {
   try {
     pg = require('pg');
   } catch {
-    Logger.warn('PostgresWriter: pg not installed — running in no-op mode. npm install pg');
+    Logger.warn('PostgresWriter: pg not installed — no-op mode');
     _failed = true;
     return null;
   }
-  _pool = new pg.Pool({ connectionString: DB_URL });
+  _pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
   _pool.on('error', (e) => Logger.error('PostgresWriter: pool error', { error: e.message }));
   try {
     await _pool.query('SELECT 1');
@@ -38,7 +37,7 @@ async function getPool() {
     Logger.info('PostgresWriter: connected', { url: DB_URL });
   } catch (e) {
     Logger.warn('PostgresWriter: could not connect — no-op mode', { error: e.message });
-    _pool  = null;
+    _pool   = null;
     _failed = true;
   }
   return _pool;
@@ -49,59 +48,48 @@ async function _ensureSchema() {
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS tokens (
-        mint            TEXT PRIMARY KEY,
-        symbol          TEXT,
-        name            TEXT,
-        decimals        SMALLINT,
-        token_program   TEXT,
-        mint_authority  TEXT,
-        freeze_authority TEXT,
-        supply          NUMERIC,
-        first_seen_slot BIGINT,
-        first_seen_at   TIMESTAMPTZ DEFAULT NOW(),
-        updated_at      TIMESTAMPTZ DEFAULT NOW()
+        mint              TEXT PRIMARY KEY,
+        symbol            TEXT,
+        name              TEXT,
+        decimals          SMALLINT,
+        token_program     TEXT,
+        mint_authority    TEXT,
+        freeze_authority  TEXT,
+        supply            NUMERIC,
+        first_seen_slot   BIGINT,
+        first_seen_at     TIMESTAMPTZ DEFAULT NOW(),
+        updated_at        TIMESTAMPTZ DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS pools (
-        pool_account    TEXT PRIMARY KEY,
-        pool_type       TEXT,
-        mint_a          TEXT,
-        mint_b          TEXT,
-        program         TEXT,
-        fee_rate        NUMERIC,
-        tick_spacing    INT,
-        first_seen_slot BIGINT,
-        first_seen_at   TIMESTAMPTZ DEFAULT NOW()
+        pool_account      TEXT PRIMARY KEY,
+        pool_type         TEXT,
+        mint_a            TEXT,
+        mint_b            TEXT,
+        program           TEXT,
+        fee_rate          NUMERIC,
+        tick_spacing      INT,
+        first_seen_slot   BIGINT,
+        first_seen_at     TIMESTAMPTZ DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS ohlcv_candles (
-        time        TIMESTAMPTZ NOT NULL,
-        mint        TEXT        NOT NULL,
-        window      TEXT        NOT NULL,
-        open        NUMERIC,
-        high        NUMERIC,
-        low         NUMERIC,
-        close       NUMERIC,
-        volume      NUMERIC,
-        ticks       INT,
-        PRIMARY KEY (time, mint, window)
+        time    TIMESTAMPTZ      NOT NULL,
+        mint    TEXT             NOT NULL,
+        tf      TEXT             NOT NULL,
+        open    DOUBLE PRECISION,
+        high    DOUBLE PRECISION,
+        low     DOUBLE PRECISION,
+        close   DOUBLE PRECISION,
+        volume  DOUBLE PRECISION,
+        ticks   INT,
+        buys    INT DEFAULT 0,
+        sells   INT DEFAULT 0,
+        PRIMARY KEY (time, mint, tf)
       );
-    `);
 
-    // Try to create TimescaleDB hypertable (silently skip if extension not available)
-    try {
-      await client.query(`
-        SELECT create_hypertable('ohlcv_candles', 'time', if_not_exists => TRUE);
-      `);
-      Logger.info('PostgresWriter: TimescaleDB hypertable configured');
-    } catch {
-      Logger.info('PostgresWriter: TimescaleDB not available — using regular table');
-    }
-
-    // Index for fast token queries
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_ohlcv_mint_window ON ohlcv_candles (mint, window, time DESC);
-      CREATE INDEX IF NOT EXISTS idx_pools_mints ON pools (mint_a, mint_b);
+      CREATE INDEX IF NOT EXISTS idx_ohlcv_mint_tf ON ohlcv_candles (mint, tf, time DESC);
+      CREATE INDEX IF NOT EXISTS idx_pools_mints   ON pools (mint_a, mint_b);
     `);
   } finally {
     client.release();
@@ -123,7 +111,7 @@ async function writeToken(mintInfo) {
       freeze_authority=EXCLUDED.freeze_authority,
       supply=EXCLUDED.supply,
       updated_at=NOW()
-  `, [mint, symbol || null, name || null, decimals || null, tokenProgram || null,
+  `, [mint, symbol || null, name || null, decimals ?? null, tokenProgram || null,
       mintAuthority || null, freezeAuthority || null, supply || null, slot || null]);
 }
 
@@ -143,31 +131,34 @@ async function writePool(poolInfo) {
 async function writeCandle(candle) {
   const p = await getPool();
   if (!p) return;
-  const { mint, window, openTime, open, high, low, close, volume, ticks } = candle;
+  const { mint, window: tf, openTime, open, high, low, close, volume, ticks, buys = 0, sells = 0 } = candle;
   await p.query(`
-    INSERT INTO ohlcv_candles (time, mint, window, open, high, low, close, volume, ticks)
-    VALUES (to_timestamp($1 / 1000.0), $2, $3, $4, $5, $6, $7, $8, $9)
-    ON CONFLICT (time, mint, window) DO UPDATE SET
-      high=GREATEST(ohlcv_candles.high, EXCLUDED.high),
-      low=LEAST(ohlcv_candles.low, EXCLUDED.low),
-      close=EXCLUDED.close,
-      volume=ohlcv_candles.volume + EXCLUDED.volume,
-      ticks=ohlcv_candles.ticks + EXCLUDED.ticks
-  `, [openTime, mint, window, open, high, low, close, volume, ticks]);
+    INSERT INTO ohlcv_candles (time, mint, tf, open, high, low, close, volume, ticks, buys, sells)
+    VALUES (to_timestamp($1 / 1000.0), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ON CONFLICT (time, mint, tf) DO UPDATE SET
+      high   = GREATEST(ohlcv_candles.high,  EXCLUDED.high),
+      low    = LEAST(ohlcv_candles.low,       EXCLUDED.low),
+      close  = EXCLUDED.close,
+      volume = ohlcv_candles.volume + EXCLUDED.volume,
+      ticks  = ohlcv_candles.ticks  + EXCLUDED.ticks,
+      buys   = ohlcv_candles.buys   + EXCLUDED.buys,
+      sells  = ohlcv_candles.sells  + EXCLUDED.sells
+  `, [openTime, mint, tf, open, high, low, close, volume, ticks, buys, sells]);
 }
 
 // ── Read operations ───────────────────────────────────────────────────────────
 
-async function getCandles(mint, windowName, limit = 100) {
+async function getCandles(mint, tf, limit = 200) {
   const p = await getPool();
   if (!p) return [];
   const { rows } = await p.query(`
-    SELECT extract(epoch from time)*1000 AS ts, open, high, low, close, volume, ticks
+    SELECT extract(epoch from time)*1000 AS t, open AS o, high AS h, low AS l, close AS c,
+           volume AS v, ticks AS n, buys AS b, sells AS s
     FROM ohlcv_candles
-    WHERE mint=$1 AND window=$2
+    WHERE mint=$1 AND tf=$2
     ORDER BY time DESC LIMIT $3
-  `, [mint, windowName, limit]);
-  return rows.reverse(); // chronological order
+  `, [mint, tf, limit]);
+  return rows.reverse(); // chronological
 }
 
 async function getToken(mint) {
