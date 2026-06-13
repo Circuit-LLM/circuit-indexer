@@ -317,7 +317,7 @@ async function handleAccount(event) {
     vaultRegistry.set(poolPS.baseVault,  { ...entry, isVault0: true,  pairedVault: poolPS.quoteVault });
     vaultRegistry.set(poolPS.quoteVault, { ...entry, isVault0: false, pairedVault: poolPS.baseVault  });
     await redis.writePool(event.pubkey, { ...poolPS, poolType: 'pumpswap' });
-    await redis.writePoolByMint(poolPS.baseMint, event.pubkey);
+    await redis.writePoolByMint(poolPS.quoteMint, event.pubkey); // quoteMint = token (baseMint = SOL)
     return;
   }
 

@@ -25,7 +25,7 @@ const Logger = require('../lib/logger');
 const PRICE_TTL        = 30;    // seconds — USD price records
 const PRICE_SOL_TTL    = 120;   // seconds — SOL price records
 const POOL_TTL         = 60;    // seconds — pool state
-const POOL_BY_MINT_TTL = 120;   // seconds — reverse index
+const POOL_BY_MINT_TTL = 86400; // seconds — reverse index (24h: pool addresses don't change)
 
 // Price history ring buffer config
 const PH_MAX_ENTRIES   = 300;   // ~5 min at 1 tick/sec for active pools
