@@ -317,7 +317,13 @@ async function handleAccount(event) {
     vaultRegistry.set(poolPS.baseVault,  { ...entry, isVault0: true,  pairedVault: poolPS.quoteVault });
     vaultRegistry.set(poolPS.quoteVault, { ...entry, isVault0: false, pairedVault: poolPS.baseVault  });
     await redis.writePool(event.pubkey, { ...poolPS, poolType: 'pumpswap' });
-    await redis.writePoolByMint(poolPS.quoteMint, event.pubkey); // quoteMint = token (baseMint = SOL)
+    // baseMint = token, quoteMint = WSOL (or USDC on USD-quoted pools). Index the TOKEN → pool
+    // mapping, and only when the quote is SOL so this pool can yield a SOL price. NEVER index the
+    // quote currency (WSOL/USDC) — doing so hijacks the reverse index for major tokens and poisons
+    // their price resolution. (The vault handler re-affirms baseMint → pool once balances arrive.)
+    if (poolPS.quoteMint === SOL_MINT) {
+      await redis.writePoolByMint(poolPS.baseMint, event.pubkey);
+    }
     return;
   }
 
