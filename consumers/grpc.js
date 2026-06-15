@@ -142,15 +142,11 @@ class GrpcConsumer {
         // are kept for CPMM/PumpSwap vault balances — narrowed to specific vaults in a later step.
         rest:     { account: [], owner: ['CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'], filters: [] },
       },
-      transactions: {
-        circuit: {
-          vote:            false,
-          failed:          false,
-          accountInclude:  WATCHED_PROGRAMS,
-          accountExclude:  [],
-          accountRequired: [],
-        },
-      },
+      // Transactions stream dropped (1d-c) — it was ~76% of the firehose (~$13.9/day at full
+      // consumption). Candle buy/sell/volume is now derived from base-vault balance deltas in
+      // handleAccount (same pools, same per-swap accounting), so we no longer need the full
+      // transaction firehose just to count swaps.
+      transactions:      {},
       slots:             { circuit: {} },
       blocks:            {},
       blocksMeta:        {},
