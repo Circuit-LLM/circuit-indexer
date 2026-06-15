@@ -390,16 +390,7 @@ async function handleAccount(event) {
                   }
                 }
                 await redis.updateTrending(reg.mint0, human1); // volume proxy
-                // Candle volume + buy/sell derived from the base-vault balance delta (1d-c) —
-                // replaces the dropped transactions stream. Only the base vault (isVault0) is
-                // counted, mirroring the prior per-swap accounting (no double-count of the quote
-                // side). Direction: base tokens leaving the pool = BUY. Volume ≈ |Δbase| × price.
-                let _volSol = 0, _isBuy;
-                if (reg.isVault0 && poolData._vault0Balance != null && poolData._vault0Balance !== balance) {
-                  _isBuy  = balance < poolData._vault0Balance;
-                  _volSol = (Math.abs(balance - poolData._vault0Balance) / Math.pow(10, reg.dec0)) * updated.price;
-                }
-                ohlcv.tick(reg.mint0, updated.price, _volSol, event.ts, _isBuy);
+                ohlcv.tick(reg.mint0, updated.price, 0, event.ts);
               }
             }
             await redis.writePool(reg.poolAccount, updated);
