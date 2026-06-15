@@ -21,6 +21,7 @@ process.stderr.on('error', err => { if (err.code !== 'EPIPE') throw err; });
 const Logger     = require('./lib/logger');
 const { OHLCVAggregator } = require('./lib/ohlcv');
 const bs58       = require('bs58').default ?? require('bs58');
+const { toBuf }  = require('./lib/databuf');
 const raydium    = require('./parsers/raydium');
 const orca       = require('./parsers/orca');
 const cpmm       = require('./parsers/cpmm');
@@ -334,7 +335,7 @@ async function handleAccount(event) {
     const reg = vaultRegistry.get(event.pubkey);
     if (reg && reg.dec0 !== null && reg.dec1 !== null) {
       try {
-        const vaultBuf = Buffer.from(bs58.decode(event.data));
+        const vaultBuf = toBuf(event.data);
         if (vaultBuf.length >= 72) {
           const balance = Number(vaultBuf.readBigUInt64LE(64)); // SPL token balance at offset 64
           // Fetch the other vault's last known balance from Redis

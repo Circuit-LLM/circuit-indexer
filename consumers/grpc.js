@@ -164,7 +164,7 @@ class GrpcConsumer {
         pubkey:     _tob58(acc.pubkey),
         owner:      _tob58(acc.owner),
         lamports:   Number(acc.lamports),
-        data:       _tob58(acc.data),
+        data:       acc.data,   // raw bytes (Uint8Array) — parsers normalize via toBuf(); no base58 round-trip
         executable: acc.executable,
         rentEpoch:  Number(acc.rentEpoch),
         slot:       Number(data.account.slot),

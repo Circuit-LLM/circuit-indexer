@@ -14,6 +14,7 @@
 'use strict';
 
 const bs58 = require('bs58').default ?? require('bs58');
+const { toBuf } = require('../lib/databuf');
 
 const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const RAYDIUM_CLMM   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
@@ -146,10 +147,13 @@ function parseClmm(buf) {
 
 function processAccountEvent(event) {
   if (event.type !== 'account') return null;
+  // Owner guard: skip the costly parse unless this account belongs to a Raydium program.
+  // (Other parsers already guard on owner; raydium did not, so it processed every event.)
+  if (event.owner !== RAYDIUM_AMM_V4 && event.owner !== RAYDIUM_CLMM) return null;
 
   let buf;
   try {
-    buf = Buffer.from(bs58.decode(event.data));
+    buf = toBuf(event.data);
   } catch { return null; }
 
   let pool = null;

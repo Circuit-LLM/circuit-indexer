@@ -18,6 +18,7 @@
 'use strict';
 
 const bs58 = require('bs58').default ?? require('bs58');
+const { toBuf } = require('../lib/databuf');
 
 const PUMPSWAP_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
 const DISCRIMINATOR    = Buffer.from('f19a6d0411b16dbc', 'hex');
@@ -60,7 +61,7 @@ function processAccountEvent(event) {
 
   let buf;
   try {
-    buf = Buffer.from(bs58.decode(event.data));
+    buf = toBuf(event.data);
   } catch { return null; }
 
   const pool = parsePumpswap(buf);

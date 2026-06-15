@@ -27,6 +27,7 @@
 'use strict';
 
 const bs58 = require('bs58').default ?? require('bs58');
+const { toBuf } = require('../lib/databuf');
 
 const ORCA_WHIRLPOOL_PROGRAM = 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc';
 const WHIRLPOOL_SIZE         = 653;
@@ -109,7 +110,7 @@ function processAccountEvent(event) {
 
   let buf;
   try {
-    buf = Buffer.from(bs58.decode(event.data));
+    buf = toBuf(event.data);
   } catch { return null; }
 
   const pool = parseWhirlpool(buf, null, null);

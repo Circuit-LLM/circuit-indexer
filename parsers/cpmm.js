@@ -25,6 +25,7 @@
 'use strict';
 
 const bs58 = require('bs58').default ?? require('bs58');
+const { toBuf } = require('../lib/databuf');
 
 const RAYDIUM_CPMM = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
 
@@ -83,7 +84,7 @@ function processAccountEvent(event) {
 
   let buf;
   try {
-    buf = Buffer.from(bs58.decode(event.data));
+    buf = toBuf(event.data);
   } catch { return null; }
 
   const pool = parseCpmm(buf);

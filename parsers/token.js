@@ -15,6 +15,7 @@
 'use strict';
 
 const bs58 = require('bs58').default ?? require('bs58');
+const { toBuf } = require('../lib/databuf');
 
 const TOKEN_PROGRAM      = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -36,7 +37,7 @@ function parseMint(dataB58, owner) {
 
   let buf;
   try {
-    buf = Buffer.from(bs58.decode(dataB58));
+    buf = toBuf(dataB58);
   } catch {
     return null;
   }

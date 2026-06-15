@@ -20,6 +20,7 @@
 // Human price = (vSol / 1e9) / (vToken / 10^decimals).
 // Decimals are NOT stored here — use circuit:mint:{mint}.decimals or default 6.
 'use strict';
+const { toBuf } = require('../lib/databuf');
 
 const PUMP_PROGRAM  = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const BC_DATA_SIZE  = 49; // 8 discriminator + 5×u64 + 1 bool
@@ -68,8 +69,7 @@ function processAccountEvent(event) {
 
   let buf;
   try {
-    const bs58 = require('bs58').default ?? require('bs58');
-    buf = Buffer.from(bs58.decode(event.data));
+    buf = toBuf(event.data);
   } catch { return null; }
 
   const pool = parseBondingCurve(buf);
