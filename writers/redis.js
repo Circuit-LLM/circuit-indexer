@@ -54,7 +54,7 @@ async function getClient() {
   _client    = new ioredis(url, { lazyConnect: true, maxRetriesPerRequest: 1 });
   try {
     await _client.connect();
-    Logger.info('RedisWriter: connected', { url });
+    Logger.info('RedisWriter: connected', { url: url.replace(/\/\/[^@]*@/, '//***@') });
   } catch (e) {
     Logger.warn('RedisWriter: could not connect to Redis — running in no-op mode', { error: e.message });
     _client = null;
