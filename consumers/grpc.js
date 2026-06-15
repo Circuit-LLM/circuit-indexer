@@ -27,7 +27,9 @@ const WATCHED_PROGRAMS = [
   'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
   'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', // Raydium CPMM
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',  // Orca Whirlpools
-  'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',  // Meteora DLMM
+  // Meteora DLMM (LBUZKh…) removed — there is NO meteora parser, so 100% of its events were
+  // received and discarded: ~31% of the entire firehose (85MB/45s) of pure waste. Re-add this
+  // line ONLY together with a parsers/meteora.js if we want Meteora market coverage.
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',  // Pump.fun bonding curve
   'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',  // PumpSwap AMM
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',  // Token Program
@@ -74,6 +76,7 @@ class GrpcConsumer {
     this._client = new Client(endpoint, token, {
       // gRPC channel options
       'grpc.max_receive_message_length': 64 * 1024 * 1024, // 64 MB
+      'grpc.default_compression_algorithm': 2, // gzip — request a compressed stream to cut egress bytes (Triton bills wire volume)
     });
 
     await this._subscribe();
