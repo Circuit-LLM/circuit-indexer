@@ -37,6 +37,7 @@ const _poolBuf   = new Map(); // poolAccount -> row (first-seen wins, matches ON
 const _tokenBuf  = new Map(); // mint -> row (last write wins)
 
 let _flushing   = false;
+let _inflight   = null;  // promise for the currently-running flush (so disconnect can await it)
 let _flushTimer = null;
 
 const _stats = {
@@ -227,9 +228,14 @@ async function _flushTable(buf, mapRow, cols, conflictClause) {
   }
 }
 
-async function _flushAll() {
-  if (_flushing) return;
+function _flushAll() {
+  if (_flushing) return _inflight || Promise.resolve(); // let callers await the in-flight flush
   _flushing = true;
+  _inflight = _runFlush();
+  return _inflight;
+}
+
+async function _runFlush() {
   const t0 = Date.now();
   try {
     await _flushTable(
@@ -305,7 +311,8 @@ function stats() { return { ..._stats, buffered: _candleBuf.size + _poolBuf.size
 
 async function disconnect() {
   if (_flushTimer) { clearInterval(_flushTimer); _flushTimer = null; }
-  await _flushAll().catch(() => {}); // final drain
+  await _flushAll().catch(() => {}); // finish any in-flight flush (returns the in-flight promise)
+  await _flushAll().catch(() => {}); // drain rows buffered during that flush
   if (_pool) { await _pool.end(); _pool = null; }
 }
 
