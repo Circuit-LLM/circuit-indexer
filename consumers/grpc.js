@@ -131,11 +131,16 @@ class GrpcConsumer {
     const { SubscribeRequest } = require('@triton-one/yellowstone-grpc/dist/grpc/geyser');
     return SubscribeRequest.fromPartial({
       accounts: {
-        circuit: {
-          account: [],
-          owner:   WATCHED_PROGRAMS,
-          filters: [],
-        },
+        // Pool-state accounts only. dataSize filters drop the large tick-array / observation
+        // accounts these programs also own — the parsers already discard those (size check),
+        // so we were paying to receive ~31MB/45s of data we threw away. Sizes verified on-chain
+        // (CLMM PoolState 1544, Orca Whirlpool 653, PumpSwap pool 301).
+        clmm:     { account: [], owner: ['CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'], filters: [{ datasize: 1544 }] },
+        orca:     { account: [], owner: ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'],  filters: [{ datasize: 653 }] },
+        pumpswap: { account: [], owner: ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'], filters: [{ datasize: 301 }] },
+        // CPMM pool config + Pump.fun bonding curves are small (left unfiltered). Token/Token-2022
+        // are kept for CPMM/PumpSwap vault balances — narrowed to specific vaults in a later step.
+        rest:     { account: [], owner: ['CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'], filters: [] },
       },
       transactions: {
         circuit: {
