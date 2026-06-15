@@ -9,14 +9,40 @@
 // Data retention is handled externally by a systemd timer (circuit-candle-retention.service).
 //
 // No-op if Postgres is unavailable — indexer runs fine without it.
+//
+// HOT-PATH NOTE (Phase 2): writeToken/writePool/writeCandle do NOT touch the DB
+// synchronously. They coalesce rows into in-memory buffers and return immediately;
+// a background timer flushes batched multi-row upserts off the event path. Postgres
+// is history/analytics only — the live trading path reads Redis — so a flush failure
+// just drops a batch (logged) and never blocks or corrupts the indexer.
 'use strict';
 
 const Logger = require('../lib/logger');
 
 const DB_URL = process.env.DATABASE_URL || 'postgresql://localhost/circuit_index';
 
+// ── Batching config ─────────────────────────────────────────────────────────
+const FLUSH_INTERVAL_MS = Number(process.env.PG_FLUSH_INTERVAL_MS || 2000);
+const FLUSH_AT_ROWS     = Number(process.env.PG_FLUSH_AT_ROWS     || 1000); // size-trigger
+const CHUNK_ROWS        = 1000;   // rows per INSERT statement (param-limit safe: 11*1000 < 65535)
+const MAX_BUFFER_ROWS   = 50_000; // hard cap per buffer — drop-oldest if flush is failing/backed up
+
 let _pool   = null;
 let _failed = false; // don't retry after first connection failure
+
+// Coalescing buffers (Map de-dupes within a flush window → also avoids the
+// "ON CONFLICT cannot affect row a second time" error from duplicate keys in one INSERT).
+const _candleBuf = new Map(); // `${openTime}|${mint}|${tf}` -> merged candle
+const _poolBuf   = new Map(); // poolAccount -> row (first-seen wins, matches ON CONFLICT DO NOTHING)
+const _tokenBuf  = new Map(); // mint -> row (last write wins)
+
+let _flushing   = false;
+let _flushTimer = null;
+
+const _stats = {
+  candlesBuffered: 0, poolsBuffered: 0, tokensBuffered: 0,
+  rowsFlushed: 0, rowsDropped: 0, flushes: 0, flushErrors: 0, lastFlushMs: 0,
+};
 
 async function getPool() {
   if (_pool)   return _pool;
@@ -34,7 +60,7 @@ async function getPool() {
   try {
     await _pool.query('SELECT 1');
     await _ensureSchema();
-    Logger.info('PostgresWriter: connected', { url: DB_URL });
+    Logger.info('PostgresWriter: connected', { url: DB_URL.replace(/\/\/[^@]*@/, '//***@') });
   } catch (e) {
     Logger.warn('PostgresWriter: could not connect — no-op mode', { error: e.message });
     _pool   = null;
@@ -96,54 +122,161 @@ async function _ensureSchema() {
   }
 }
 
-// ── Write operations ──────────────────────────────────────────────────────────
+// ── Buffer helpers ──────────────────────────────────────────────────────────
 
-async function writeToken(mintInfo) {
-  const p = await getPool();
-  if (!p) return;
-  const { mint, symbol, name, decimals, tokenProgram, mintAuthority, freezeAuthority, supply, slot } = mintInfo;
-  await p.query(`
-    INSERT INTO tokens (mint, symbol, name, decimals, token_program, mint_authority, freeze_authority, supply, first_seen_slot)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    ON CONFLICT (mint) DO UPDATE SET
-      symbol=EXCLUDED.symbol, name=EXCLUDED.name,
-      mint_authority=EXCLUDED.mint_authority,
-      freeze_authority=EXCLUDED.freeze_authority,
-      supply=EXCLUDED.supply,
-      updated_at=NOW()
-  `, [mint, symbol || null, name || null, decimals ?? null, tokenProgram || null,
-      mintAuthority || null, freezeAuthority || null, supply || null, slot || null]);
+// Bound a buffer: if it exceeds the hard cap (flush failing / DB down while we
+// keep buffering), drop the oldest entries so memory stays bounded.
+function _bound(buf) {
+  while (buf.size > MAX_BUFFER_ROWS) {
+    const oldest = buf.keys().next().value;
+    buf.delete(oldest);
+    _stats.rowsDropped++;
+  }
 }
 
-async function writePool(poolInfo) {
-  const p = await getPool();
-  if (!p) return;
-  const { poolAccount, type, mint0, mint1, mintA, mintB, program, feeRate, tickSpacing, slot } = poolInfo;
-  const a = mintA || mint0;
-  const b = mintB || mint1;
-  await p.query(`
-    INSERT INTO pools (pool_account, pool_type, mint_a, mint_b, program, fee_rate, tick_spacing, first_seen_slot)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-    ON CONFLICT (pool_account) DO NOTHING
-  `, [poolAccount, type, a, b, program || null, feeRate || null, tickSpacing || null, slot || null]);
+function _maybeFlushSoon() {
+  if (_candleBuf.size + _poolBuf.size + _tokenBuf.size >= FLUSH_AT_ROWS) {
+    // size trigger — flush on next tick, don't block the caller
+    setImmediate(() => { _flushAll().catch(() => {}); });
+  }
 }
 
-async function writeCandle(candle) {
+// ── Write operations (enqueue only — return immediately) ──────────────────────
+
+function writeToken(mintInfo) {
+  if (_failed) return Promise.resolve();
+  const { mint } = mintInfo;
+  if (!mint) return Promise.resolve();
+  _tokenBuf.set(mint, mintInfo); // last write wins
+  _stats.tokensBuffered++;
+  _bound(_tokenBuf);
+  _maybeFlushSoon();
+  return Promise.resolve();
+}
+
+function writePool(poolInfo) {
+  if (_failed) return Promise.resolve();
+  const { poolAccount } = poolInfo;
+  if (!poolAccount) return Promise.resolve();
+  if (!_poolBuf.has(poolAccount)) {       // first-seen wins (matches ON CONFLICT DO NOTHING)
+    _poolBuf.set(poolAccount, poolInfo);
+    _stats.poolsBuffered++;
+    _bound(_poolBuf);
+    _maybeFlushSoon();
+  }
+  return Promise.resolve();
+}
+
+function writeCandle(candle) {
+  if (_failed) return Promise.resolve();
+  const { mint, window: tf, openTime } = candle;
+  if (!mint || !tf || openTime == null) return Promise.resolve();
+  const key = `${openTime}|${mint}|${tf}`;
+  const prev = _candleBuf.get(key);
+  if (!prev) {
+    _candleBuf.set(key, { ...candle });
+  } else {
+    // Coalesce same-bucket candles (defensive; aggregator normally emits once per bucket)
+    prev.high   = Math.max(prev.high, candle.high);
+    prev.low    = Math.min(prev.low,  candle.low);
+    prev.close  = candle.close;                       // latest close
+    prev.volume = (prev.volume || 0) + (candle.volume || 0);
+    prev.ticks  = (prev.ticks  || 0) + (candle.ticks  || 0);
+    prev.buys   = (prev.buys   || 0) + (candle.buys   || 0);
+    prev.sells  = (prev.sells  || 0) + (candle.sells  || 0);
+  }
+  _stats.candlesBuffered++;
+  _bound(_candleBuf);
+  _maybeFlushSoon();
+  return Promise.resolve();
+}
+
+// ── Batched flush ─────────────────────────────────────────────────────────────
+
+// Build a multi-row "INSERT ... VALUES (...),(...) ON CONFLICT ..." with positional params.
+function _buildBatch(rows, cols, conflictClause) {
+  const placeholders = [];
+  const params = [];
+  let i = 0;
+  for (const row of rows) {
+    const ph = [];
+    for (const val of row) { params.push(val); ph.push(`$${++i}`); }
+    placeholders.push(`(${ph.join(',')})`);
+  }
+  return { text: `INSERT INTO ${cols} VALUES ${placeholders.join(',')} ${conflictClause}`, params };
+}
+
+async function _flushTable(buf, mapRow, cols, conflictClause) {
+  if (buf.size === 0) return;
   const p = await getPool();
-  if (!p) return;
-  const { mint, window: tf, openTime, open, high, low, close, volume, ticks, buys = 0, sells = 0 } = candle;
-  await p.query(`
-    INSERT INTO ohlcv_candles (time, mint, tf, open, high, low, close, volume, ticks, buys, sells)
-    VALUES (to_timestamp($1 / 1000.0), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    ON CONFLICT (time, mint, tf) DO UPDATE SET
-      high   = GREATEST(ohlcv_candles.high,  EXCLUDED.high),
-      low    = LEAST(ohlcv_candles.low,       EXCLUDED.low),
-      close  = EXCLUDED.close,
-      volume = ohlcv_candles.volume + EXCLUDED.volume,
-      ticks  = ohlcv_candles.ticks  + EXCLUDED.ticks,
-      buys   = ohlcv_candles.buys   + EXCLUDED.buys,
-      sells  = ohlcv_candles.sells  + EXCLUDED.sells
-  `, [openTime, mint, tf, open, high, low, close, volume, ticks, buys, sells]);
+  if (!p) return; // no-op mode — leave buffer; _bound caps it
+  // Snapshot + clear so new writes during the flush land in the next window
+  const entries = Array.from(buf.values());
+  buf.clear();
+  try {
+    for (let off = 0; off < entries.length; off += CHUNK_ROWS) {
+      const chunk = entries.slice(off, off + CHUNK_ROWS).map(mapRow);
+      const { text, params } = _buildBatch(chunk, cols, conflictClause);
+      await p.query(text, params);
+      _stats.rowsFlushed += chunk.length;
+    }
+  } catch (e) {
+    _stats.flushErrors++;
+    _stats.rowsDropped += entries.length; // dropped: PG is non-critical history, never block the indexer
+    Logger.error('PostgresWriter: flush failed (batch dropped)', { table: cols.split(' ')[0], rows: entries.length, error: e.message });
+  }
+}
+
+async function _flushAll() {
+  if (_flushing) return;
+  _flushing = true;
+  const t0 = Date.now();
+  try {
+    await _flushTable(
+      _tokenBuf,
+      (m) => [m.mint, m.symbol || null, m.name || null, m.decimals ?? null, m.tokenProgram || null,
+              m.mintAuthority || null, m.freezeAuthority || null, m.supply || null, m.slot || null],
+      `tokens (mint, symbol, name, decimals, token_program, mint_authority, freeze_authority, supply, first_seen_slot)`,
+      `ON CONFLICT (mint) DO UPDATE SET
+         symbol=EXCLUDED.symbol, name=EXCLUDED.name,
+         mint_authority=EXCLUDED.mint_authority,
+         freeze_authority=EXCLUDED.freeze_authority,
+         supply=EXCLUDED.supply, updated_at=NOW()`
+    );
+    await _flushTable(
+      _poolBuf,
+      (pi) => [pi.poolAccount, pi.type, pi.mintA || pi.mint0, pi.mintB || pi.mint1,
+               pi.program || null, pi.feeRate || null, pi.tickSpacing || null, pi.slot || null],
+      `pools (pool_account, pool_type, mint_a, mint_b, program, fee_rate, tick_spacing, first_seen_slot)`,
+      `ON CONFLICT (pool_account) DO NOTHING`
+    );
+    await _flushTable(
+      _candleBuf,
+      // openTime is epoch-ms; pass a Date so node-postgres serializes it to timestamptz
+      // (avoids needing to_timestamp() in SQL, which the generic batch builder can't emit).
+      (c) => [new Date(c.openTime), c.mint, c.window, c.open, c.high, c.low, c.close, c.volume, c.ticks, c.buys ?? 0, c.sells ?? 0],
+      `ohlcv_candles (time, mint, tf, open, high, low, close, volume, ticks, buys, sells)`,
+      // Preserve original aggregating upsert: a bucket re-emitted across flushes accumulates.
+      `ON CONFLICT (time, mint, tf) DO UPDATE SET
+         high   = GREATEST(ohlcv_candles.high, EXCLUDED.high),
+         low    = LEAST(ohlcv_candles.low,     EXCLUDED.low),
+         close  = EXCLUDED.close,
+         volume = ohlcv_candles.volume + EXCLUDED.volume,
+         ticks  = ohlcv_candles.ticks  + EXCLUDED.ticks,
+         buys   = ohlcv_candles.buys   + EXCLUDED.buys,
+         sells  = ohlcv_candles.sells  + EXCLUDED.sells`
+    );
+    _stats.flushes++;
+    _stats.lastFlushMs = Date.now() - t0;
+  } finally {
+    _flushing = false;
+  }
+}
+
+function _startFlushTimer() {
+  if (_flushTimer) return;
+  _flushTimer = setInterval(() => { _flushAll().catch(() => {}); }, FLUSH_INTERVAL_MS);
+  _flushTimer.unref();
 }
 
 // ── Read operations ───────────────────────────────────────────────────────────
@@ -168,8 +301,14 @@ async function getToken(mint) {
   return rows[0] || null;
 }
 
+function stats() { return { ..._stats, buffered: _candleBuf.size + _poolBuf.size + _tokenBuf.size }; }
+
 async function disconnect() {
+  if (_flushTimer) { clearInterval(_flushTimer); _flushTimer = null; }
+  await _flushAll().catch(() => {}); // final drain
   if (_pool) { await _pool.end(); _pool = null; }
 }
 
-module.exports = { writeToken, writePool, writeCandle, getCandles, getToken, disconnect };
+_startFlushTimer();
+
+module.exports = { writeToken, writePool, writeCandle, getCandles, getToken, disconnect, stats };
