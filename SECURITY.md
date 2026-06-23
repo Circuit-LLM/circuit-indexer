@@ -1,10 +1,16 @@
-# Security Policy
+# Security
+
+circuit-indexer is a write-only data pipeline that parses untrusted on-chain input. Security matters.
+
+---
 
 ## Supported versions
 
 | Version | Supported |
 |---|---|
-| 0.1.x (current) | ✅ |
+| 0.7.x (current) | ✅ |
+
+---
 
 ## Scope
 
@@ -16,7 +22,9 @@ circuit-indexer is a write-only data pipeline process. Its security surface is:
 - **No inbound network listener** — the indexer opens no HTTP or TCP ports
 - **No authentication handling** — credentials (Redis URL, Postgres URL, gRPC token) are read from environment variables, never logged
 
-## Reporting a vulnerability
+---
+
+## Reporting Vulnerabilities
 
 Please do not open a public GitHub issue for security vulnerabilities.
 
@@ -29,6 +37,8 @@ Include:
 
 We will acknowledge receipt within 48 hours and aim to issue a patch within 7 days for confirmed vulnerabilities.
 
-## Responsible disclosure
+---
+
+## Responsible Disclosure
 
 We ask that you give us reasonable time to address the issue before public disclosure. We will credit researchers who report valid vulnerabilities.
