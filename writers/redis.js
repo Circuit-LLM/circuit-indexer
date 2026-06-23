@@ -137,6 +137,27 @@ async function appendPriceHistory(mint, priceSol, ts) {
 
 // Write a completed OHLCV candle to the per-mint ring buffer for the given window.
 // Called from the indexer's onCandle callback.
+// Idempotent candle write. A bucket is re-emitted many times over its life (live
+// snapshots of the open candle); each emission is a full cumulative snapshot. Update
+// the head entry in place when the openTime matches instead of appending a duplicate —
+// lightweight-charts and the agent scorer require one entry per bucket (strictly
+// ascending unique time). Atomic via Lua because writeCandleBuffer is fire-and-forget,
+// so two writes for the same key could otherwise race on the read-modify-write.
+const CANDLE_WRITE_LUA = `
+local head = redis.call('LINDEX', KEYS[1], 0)
+if head then
+  local ht = tonumber(string.match(head, '^{"t":(%-?%d+)'))
+  local nt = tonumber(ARGV[2])
+  if ht == nt then redis.call('LSET', KEYS[1], 0, ARGV[1])
+  elseif nt < ht then return 0
+  else redis.call('LPUSH', KEYS[1], ARGV[1]) end
+else
+  redis.call('LPUSH', KEYS[1], ARGV[1])
+end
+redis.call('LTRIM', KEYS[1], 0, tonumber(ARGV[3]) - 1)
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+return 1`;
+
 async function writeCandleBuffer(candle) {
   const cfg = CANDLE_CFG[candle.window];
   if (!cfg) return; // unsupported window
@@ -154,11 +175,7 @@ async function writeCandleBuffer(candle) {
     b: candle.buys  ?? 0,
     s: candle.sells ?? 0,
   });
-  const pipe  = r.pipeline();
-  pipe.lpush(key, entry);
-  pipe.ltrim(key, 0, cfg.max - 1);
-  pipe.expire(key, cfg.ttl);
-  await pipe.exec();
+  await r.eval(CANDLE_WRITE_LUA, 1, key, entry, String(candle.openTime), String(cfg.max), String(cfg.ttl));
 }
 
 // ── Read operations ───────────────────────────────────────────────────────────

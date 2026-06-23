@@ -177,14 +177,15 @@ function writeCandle(candle) {
   if (!prev) {
     _candleBuf.set(key, { ...candle });
   } else {
-    // Coalesce same-bucket candles (defensive; aggregator normally emits once per bucket)
+    // Coalesce same-bucket candles. Emissions are now cumulative snapshots of the open
+    // bucket (not partials), so keep max/latest — summing would double-count volume.
     prev.high   = Math.max(prev.high, candle.high);
     prev.low    = Math.min(prev.low,  candle.low);
     prev.close  = candle.close;                       // latest close
-    prev.volume = (prev.volume || 0) + (candle.volume || 0);
-    prev.ticks  = (prev.ticks  || 0) + (candle.ticks  || 0);
-    prev.buys   = (prev.buys   || 0) + (candle.buys   || 0);
-    prev.sells  = (prev.sells  || 0) + (candle.sells  || 0);
+    prev.volume = Math.max(prev.volume || 0, candle.volume || 0);
+    prev.ticks  = Math.max(prev.ticks  || 0, candle.ticks  || 0);
+    prev.buys   = Math.max(prev.buys   || 0, candle.buys   || 0);
+    prev.sells  = Math.max(prev.sells  || 0, candle.sells  || 0);
   }
   _stats.candlesBuffered++;
   _bound(_candleBuf);
@@ -262,15 +263,16 @@ async function _runFlush() {
       // (avoids needing to_timestamp() in SQL, which the generic batch builder can't emit).
       (c) => [new Date(c.openTime), c.mint, c.window, c.open, c.high, c.low, c.close, c.volume, c.ticks, c.buys ?? 0, c.sells ?? 0],
       `ohlcv_candles (time, mint, tf, open, high, low, close, volume, ticks, buys, sells)`,
-      // Preserve original aggregating upsert: a bucket re-emitted across flushes accumulates.
+      // Cumulative-snapshot upsert: a bucket re-emitted across flushes is a full snapshot,
+      // not an increment, so keep max/latest (summing would double-count volume/ticks).
       `ON CONFLICT (time, mint, tf) DO UPDATE SET
-         high   = GREATEST(ohlcv_candles.high, EXCLUDED.high),
-         low    = LEAST(ohlcv_candles.low,     EXCLUDED.low),
+         high   = GREATEST(ohlcv_candles.high,   EXCLUDED.high),
+         low    = LEAST(ohlcv_candles.low,       EXCLUDED.low),
          close  = EXCLUDED.close,
-         volume = ohlcv_candles.volume + EXCLUDED.volume,
-         ticks  = ohlcv_candles.ticks  + EXCLUDED.ticks,
-         buys   = ohlcv_candles.buys   + EXCLUDED.buys,
-         sells  = ohlcv_candles.sells  + EXCLUDED.sells`
+         volume = GREATEST(ohlcv_candles.volume, EXCLUDED.volume),
+         ticks  = GREATEST(ohlcv_candles.ticks,  EXCLUDED.ticks),
+         buys   = GREATEST(ohlcv_candles.buys,   EXCLUDED.buys),
+         sells  = GREATEST(ohlcv_candles.sells,  EXCLUDED.sells)`
     );
     _stats.flushes++;
     _stats.lastFlushMs = Date.now() - t0;

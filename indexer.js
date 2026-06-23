@@ -399,7 +399,12 @@ async function handleAccount(event) {
                   _isBuy  = balance < poolData._vault0Balance;
                   _volSol = (Math.abs(balance - poolData._vault0Balance) / Math.pow(10, reg.dec0)) * updated.price;
                 }
-                ohlcv.tick(reg.mint0, updated.price, _volSol, event.ts, _isBuy);
+                // B2: only form a candle on a real trade (a measured base-vault delta). The
+                // volume-0 ticks here are price-only re-derivations (quote-vault updates, no
+                // reserve change) that produced flat zero-volume doji candles on thinly-traded
+                // tokens. The live price (price-sol) is written above regardless, so this only
+                // affects candle shape, not the live price the agents read.
+                if (_volSol > 0) ohlcv.tick(reg.mint0, updated.price, _volSol, event.ts, _isBuy);
               }
             }
             await redis.writePool(reg.poolAccount, updated);
