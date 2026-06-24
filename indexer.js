@@ -44,6 +44,10 @@ const args = Object.fromEntries(
 
 const CONSUMER   = args.consumer || 'file';
 const FILE_PATH  = args.file     || process.env.GEYSER_FILE || '/tmp/circuit-geyser.jsonl';
+// Pool accounts whose candles come from per-swap transactions (handleTransaction) instead of
+// vault-balance deltas — full fidelity for low-volume tokens like CIRC. Their vault-delta candle
+// tick is skipped below so the two paths never double-count. Empty => vault deltas for every pool.
+const TX_WATCHLIST = new Set((process.env.CIRCUIT_TX_WATCHLIST || '').split(',').map(s => s.trim()).filter(Boolean));
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
@@ -390,21 +394,22 @@ async function handleAccount(event) {
                   }
                 }
                 await redis.updateTrending(reg.mint0, human1); // volume proxy
-                // Candle volume + buy/sell derived from the base-vault balance delta (1d-c) —
-                // replaces the dropped transactions stream. Only the base vault (isVault0) is
-                // counted, mirroring the prior per-swap accounting (no double-count of the quote
-                // side). Direction: base tokens leaving the pool = BUY. Volume ≈ |Δbase| × price.
-                let _volSol = 0, _isBuy;
-                if (reg.isVault0 && poolData._vault0Balance != null && poolData._vault0Balance !== balance) {
-                  _isBuy  = balance < poolData._vault0Balance;
-                  _volSol = (Math.abs(balance - poolData._vault0Balance) / Math.pow(10, reg.dec0)) * updated.price;
+                // Candle volume + buy/sell from the base-vault balance delta (1d-c) — EXCEPT for
+                // transaction-watchlist pools, whose candles are built per-swap in handleTransaction
+                // (full fidelity). Skipping the vault-delta tick for them is what prevents
+                // double-counting; the live price (price-sol) above is still written for every pool.
+                if (!TX_WATCHLIST.has(reg.poolAccount)) {
+                  // Only the base vault (isVault0) is counted (no double-count of the quote side).
+                  // Direction: base tokens leaving the pool = BUY. Volume ≈ |Δbase| × price.
+                  let _volSol = 0, _isBuy;
+                  if (reg.isVault0 && poolData._vault0Balance != null && poolData._vault0Balance !== balance) {
+                    _isBuy  = balance < poolData._vault0Balance;
+                    _volSol = (Math.abs(balance - poolData._vault0Balance) / Math.pow(10, reg.dec0)) * updated.price;
+                  }
+                  // B2: only form a candle on a real trade (a measured base-vault delta) — the
+                  // volume-0 ticks here are price-only re-derivations that made flat doji candles.
+                  if (_volSol > 0) ohlcv.tick(reg.mint0, updated.price, _volSol, event.ts, _isBuy);
                 }
-                // B2: only form a candle on a real trade (a measured base-vault delta). The
-                // volume-0 ticks here are price-only re-derivations (quote-vault updates, no
-                // reserve change) that produced flat zero-volume doji candles on thinly-traded
-                // tokens. The live price (price-sol) is written above regardless, so this only
-                // affects candle shape, not the live price the agents read.
-                if (_volSol > 0) ohlcv.tick(reg.mint0, updated.price, _volSol, event.ts, _isBuy);
               }
             }
             await redis.writePool(reg.poolAccount, updated);

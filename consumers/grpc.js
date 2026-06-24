@@ -129,6 +129,7 @@ class GrpcConsumer {
 
   _buildSubscribeRequest() {
     const { SubscribeRequest } = require('@triton-one/yellowstone-grpc/dist/grpc/geyser');
+    const txWatch = (process.env.CIRCUIT_TX_WATCHLIST || '').split(',').map(s => s.trim()).filter(Boolean);
     return SubscribeRequest.fromPartial({
       accounts: {
         // Pool-state accounts only. dataSize filters drop the large tick-array / observation
@@ -142,11 +143,17 @@ class GrpcConsumer {
         // are kept for CPMM/PumpSwap vault balances — narrowed to specific vaults in a later step.
         rest:     { account: [], owner: ['CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'], filters: [] },
       },
-      // Transactions stream dropped (1d-c) — it was ~76% of the firehose (~$13.9/day at full
-      // consumption). Candle buy/sell/volume is now derived from base-vault balance deltas in
-      // handleAccount (same pools, same per-swap accounting), so we no longer need the full
-      // transaction firehose just to count swaps.
-      transactions:      {},
+      // Scoped transaction stream (surgical 1d-c reversal). The full firehose was dropped because
+      // transactions were ~76% of it (~$13.9/day), but deriving candles from vault-balance deltas
+      // undercounts trades that share a slot (Geyser emits net per-slot state), so low-volume tokens
+      // look sparse. When CIRCUIT_TX_WATCHLIST is set we re-subscribe ONLY to transactions touching
+      // those pool accounts — restoring per-swap candle fidelity (handleTransaction) for them at a
+      // few MB/day, not the whole firehose. Empty list => no transaction stream (vault-delta candles
+      // for everything, the cheap default). Watchlist pools skip the vault-delta candle tick in
+      // indexer.js so the two paths never double-count.
+      transactions: txWatch.length ? {
+        circuit: { vote: false, failed: false, accountInclude: txWatch, accountExclude: [], accountRequired: [] },
+      } : {},
       slots:             { circuit: {} },
       blocks:            {},
       blocksMeta:        {},
@@ -180,7 +187,16 @@ class GrpcConsumer {
       const tx = data.transaction.transaction;
       if (!tx) return;
 
-      const accounts = (tx.transaction?.message?.accountKeys ?? []).map(_tob58);
+      // Full account list in canonical order: static keys, then address-lookup-table loaded
+      // writable, then loaded readonly. PumpSwap swaps are versioned txns using lookup tables, so
+      // the vaults live in the loaded addresses; token-balance accountIndex references this full
+      // list. Omitting loaded addresses (the prior behaviour) mis-resolved the vault and dropped
+      // most swaps — only legacy transactions matched.
+      const accounts = [
+        ...(tx.transaction?.message?.accountKeys ?? []),
+        ...(tx.meta?.loadedWritableAddresses ?? []),
+        ...(tx.meta?.loadedReadonlyAddresses ?? []),
+      ].map(_tob58);
       const preTokenBalances  = (tx.meta?.preTokenBalances  ?? []).map(b => ({
         accountIndex: b.accountIndex,
         mint:         b.mint,
