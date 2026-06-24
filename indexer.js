@@ -113,6 +113,16 @@ redis.writePriceSol = async function(mint, priceSol, source, extraFields = {}) {
   redis.appendPriceHistory(mint, priceSol, Date.now()).catch(() => {});
 };
 
+// SOL/USD oracle, derived from our own on-chain SOL/USDC pool (no external oracle like Jupiter).
+// Written to BOTH keys consumers read: the WSOL-mint key circuit:price:So111… (circuit-node's
+// getSolPrice → the website/homepage) and the literal circuit:price:SOL (circuit-price-feed
+// fallback). Callers pass the already-computed USD price for 1 SOL.
+async function _writeSolUsd(priceUsd, source) {
+  if (!(priceUsd > 0) || !isFinite(priceUsd)) return;
+  await redis.writePrice(SOL_MINT, priceUsd, source);
+  await redis.writePrice('SOL', priceUsd, source);
+}
+
 // CPMM vault registry: vault_pubkey → { poolAccount, isVault0, mint0, mint1, dec0, dec1 }
 // Populated when we see CPMM pool state accounts; used to compute price on vault updates.
 const vaultRegistry = new Map();
@@ -225,12 +235,24 @@ async function handleAccount(event) {
         // price = SOL per mint0 — direct
         await redis.writePriceSol(poolR.mint0, poolR.price, 'raydium-clmm', { poolAccount: event.pubkey });
         await redis.writePoolByMint(poolR.mint0, event.pubkey);
+        // SOL/USD oracle from our OWN on-chain data (no external oracle): a SOL/USDC CLMM pool
+        // prices SOL when mint0 is a USD stable — price = SOL per stable, so SOL/USD = 1/price.
+        // This is the live source that keeps circuit:price:SOL fresh.
+        if (STABLE_MINTS.has(poolR.mint0) && poolR.price > 0) {
+          await _writeSolUsd(1 / poolR.price, 'raydium-clmm');
+        }
       } else if (poolR.mint0 === SOL_MINT) {
         // price = TOKEN per SOL → invert for SOL per TOKEN
         const priceSol = 1 / poolR.price;
         if (isFinite(priceSol) && priceSol > 0) {
           await redis.writePriceSol(poolR.mint1, priceSol, 'raydium-clmm', { poolAccount: event.pubkey });
           await redis.writePoolByMint(poolR.mint1, event.pubkey);
+        }
+        // SOL/USD oracle from our OWN on-chain data (no external oracle): mint0=SOL, mint1=stable
+        // means price = stable per SOL = SOL's USD price directly. This is the live SOL/USDC CLMM
+        // pool (8sLbNZoA…) that keeps circuit:price:SOL fresh.
+        if (STABLE_MINTS.has(poolR.mint1) && poolR.price > 0) {
+          await _writeSolUsd(poolR.price, 'raydium-clmm');
         }
       }
     }
@@ -379,6 +401,14 @@ async function handleAccount(event) {
                     pcDecimals:   reg.dec1,
                   });
                   await redis.writePoolByMint(reg.mint0, reg.poolAccount);
+                  // SOL/USD oracle from our OWN on-chain data (no external oracle): when the base
+                  // is a USD stable, this pool prices SOL directly — updated.price = SOL per stable,
+                  // so SOL's USD price = 1/price. Keeps circuit:price:SOL fresh off the live SOL/USDC
+                  // pool. (The other ordering, SOL as mint0 vs a stable, is handled by the
+                  // _isUsdQuote branch above which writes circuit:price:SOL directly.)
+                  if (STABLE_MINTS.has(reg.mint0) && updated.price > 0) {
+                    await _writeSolUsd(1 / updated.price, src);
+                  }
                 } else if (reg.mint0 === SOL_MINT) {
                   // mint0=SOL: price = mint1 per SOL → invert
                   const priceSol = 1 / updated.price;
