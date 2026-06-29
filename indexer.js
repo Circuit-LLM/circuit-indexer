@@ -143,7 +143,14 @@ const _pendingDecimalsFetch = new Set();
 
 /**
  * Fetch decimals for unknown mints via RPC getMultipleAccounts.
- * Populates decimalsMap and vaultRegistry entries.
+ * Populates decimalsMap and vaultRegistry entries, and back-fills circuit:mint metadata.
+ *
+ * We fetch the base 82-byte mint (not just the decimals byte) so we can ALSO write a
+ * circuit:mint record for tokens the narrowed subscription (CIRCUIT_NARROW=1) doesn't carry
+ * in-stream — notably token-2022 mints WITH extensions, which exceed the 82-byte `mints` filter
+ * and would otherwise be missing decimals/supply/authorities on the /token/:mint metadata card.
+ * Every token we price has a registered pool, and every pool RPC-resolves its mints here, so this
+ * gives circuit:mint coverage for exactly the searchable/chartable set.
  */
 async function _fetchAndCacheDecimals(mints) {
   const unknown = mints.filter(m => m && !decimalsMap.has(m) && !_pendingDecimalsFetch.has(m));
@@ -152,23 +159,28 @@ async function _fetchAndCacheDecimals(mints) {
   unknown.forEach(m => _pendingDecimalsFetch.add(m));
   try {
     const { rpcCall } = require('./lib/rpc-client');
-    const resp = await rpcCall('getMultipleAccounts', [unknown, { encoding: 'base64', dataSlice: { offset: 44, length: 1 } }]);
+    const resp = await rpcCall('getMultipleAccounts', [unknown, { encoding: 'base64', dataSlice: { offset: 0, length: 82 } }]);
     const accounts = resp?.value ?? [];
     accounts.forEach((acc, i) => {
       if (!acc?.data?.[0]) return;
       try {
+        const mint = unknown[i];
         const buf = Buffer.from(acc.data[0], 'base64');
-        if (buf.length >= 1) {
-          const decimals = buf.readUInt8(0);
-          if (decimals <= 18) {
-            decimalsMap.set(unknown[i], decimals);
-            // Update any vaultRegistry entries that were waiting on this mint
-            for (const [vault, entry] of vaultRegistry) {
-              if (entry.mint0 === unknown[i] && entry.dec0 === null) entry.dec0 = decimals;
-              if (entry.mint1 === unknown[i] && entry.dec1 === null) entry.dec1 = decimals;
-            }
-          }
+        // parseMint accepts a Buffer (toBuf passes it through) — reuse the canonical mint decoder
+        // so the RPC-sourced record matches the in-stream one (decimals/supply/authorities/program).
+        const info = token.parseMint(buf, acc.owner);
+        if (!info || info.decimals == null || info.decimals > 18) return;
+        decimalsMap.set(mint, info.decimals);
+        // Update any vaultRegistry entries that were waiting on this mint
+        for (const [, entry] of vaultRegistry) {
+          if (entry.mint0 === mint && entry.dec0 === null) entry.dec0 = info.decimals;
+          if (entry.mint1 === mint && entry.dec1 === null) entry.dec1 = info.decimals;
         }
+        // Populate circuit:mint metadata in the background (don't block price resolution) —
+        // only when not already indexed in-stream, so we never clobber a fresher record.
+        redis.getMint(mint)
+          .then(existing => existing ? null : redis.writeMint(mint, { mint, ...info, source: 'rpc' }))
+          .catch(() => {});
       } catch {}
     });
   } catch { /* non-fatal — will retry on next pool update */ }

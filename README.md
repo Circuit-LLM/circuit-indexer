@@ -107,6 +107,9 @@ All configuration is via environment variables:
 | `GEYSER_FILE` | `/tmp/circuit-geyser.jsonl` | Input file path (file consumer) |
 | `GEYSER_ENDPOINT` | — | gRPC endpoint URL (grpc consumer) |
 | `GEYSER_TOKEN` | — | gRPC access token (grpc consumer) |
+| `CIRCUIT_NARROW` | `0` | gRPC consumer: narrow the account subscription to registered pool vaults + 82-byte mints instead of every SPL token account. Cuts ~⅔ of account-stream egress. See [Subscription scope](#subscription-scope-grpc-cost-control). |
+| `CIRCUIT_TX_WATCHLIST` | — | gRPC consumer: comma-separated pool addresses to receive the scoped transaction stream for (full-fidelity candles on low-volume pools). |
+| `CIRCUIT_COST_PROBE` | `0` | Log a periodic breakdown of account-stream bytes by kind (vault / mint / discarded holder). Diagnostic only; safe to leave off. |
 
 ---
 
@@ -143,6 +146,22 @@ node indexer.js --consumer=grpc
 ```
 
 This is the recommended production setup when running circuit-node without a local validator. Managed endpoints provide the same data stream as a local Geyser plugin.
+
+### Subscription scope (gRPC cost control)
+
+Managed Geyser endpoints (Triton/Helius/QuickNode) bill by **egress bytes**, so what the indexer subscribes to is a direct cost lever. Pool-state accounts (Raydium CLMM/CPMM, Orca, PumpSwap) and Pump.fun bonding curves are always subscribed with `dataSize` filters that drop the large tick-array/observation accounts the parsers discard anyway.
+
+The expensive part is SPL token accounts. CPMM and PumpSwap prices are derived from **pool vault balance deltas**, which requires watching the Token / Token-2022 programs. Subscribing to those programs *unfiltered* means receiving **every SPL token account on Solana** (~53 GB/day, of which ~⅔ are holder accounts the indexer never prices) — the "firehose."
+
+Set **`CIRCUIT_NARROW=1`** to replace that unfiltered subscription with a precise one:
+
+- the specific **registered pool vaults** (exactly the accounts that produce prices today), grown live every 8s as new pools register — `_maybeResubscribe()` re-sends the subscription with the updated vault set,
+- **82-byte mints** for metadata, and
+- the CPMM + Pump.fun pool states.
+
+This cuts the account stream by ~⅔ (holder accounts are no longer received) with **no loss of priced tokens** — only vaults in the in-memory registry ever produced a price. Decimals for both mints of every pool are RPC-resolved at registration (so reverse-ordered pools price correctly), and `circuit:mint` metadata is back-filled from the same fetch for tokens the narrowed stream doesn't carry in-stream (e.g. token-2022 mints with extensions).
+
+`CIRCUIT_NARROW` is **off by default** — the subscription is byte-for-byte the legacy one until you set it, so it can be enabled in production and rolled back with a single flag flip + restart. Use `CIRCUIT_COST_PROBE=1` to log the before/after byte breakdown.
 
 ---
 
@@ -247,6 +266,12 @@ WantedBy=default.target
 ---
 
 ## Changelog
+
+### v0.8.0
+- **Narrowed Geyser subscription (`CIRCUIT_NARROW=1`)** — replaces the unfiltered Token/Token-2022 account subscription (every SPL token account, ~53 GB/day) with the specific registered pool vaults + 82-byte mints, grown live as pools register. Cuts ~⅔ of account-stream egress with no loss of priced tokens. Off by default (legacy subscription unchanged); single-flag rollback. See [Subscription scope](#subscription-scope-grpc-cost-control).
+- **Fix: reverse-ordered PumpSwap decimals** — pools stored `base=WSOL, quote=token` defaulted the quote token's decimals to 9 ("assume WSOL") because only the base mint was RPC-resolved, mispricing those tokens 1000×. Now both pool mints are RPC-resolved and 9 is assumed only for the real WSOL mint. (Was masked under the full firehose, which pre-cached every mint's decimals.)
+- **`circuit:mint` gap-fill** — mint metadata (decimals/supply/authorities) is back-filled from the pool-registration RPC fetch for tokens the narrowed stream doesn't carry in-stream, notably token-2022 mints with extensions.
+- `CIRCUIT_COST_PROBE=1` diagnostic: periodic account-stream byte breakdown (vault / mint / discarded holder).
 
 ### v0.7.0
 - Parses Raydium AMM v4 + CLMM, Orca Whirlpool, and PumpSwap pool state, plus swap-transaction buy/sell direction and SOL volume from token-balance deltas. Writes USD and SOL prices, pool state, a pool-by-mint reverse index (24h TTL — pool addresses are immutable), mint metadata, a trending ZSET, a price-history ring buffer, and 1m/5m/1h/1d OHLCV candle ring buffers to Redis; optional Postgres history for pools, tokens, and candles. Three input consumers (file, stdin, gRPC), 30s aggregate stats logging, and graceful flush-on-shutdown.
