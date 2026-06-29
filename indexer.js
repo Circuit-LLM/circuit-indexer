@@ -63,6 +63,17 @@ const stats = {
   startedAt:    Date.now(),
 };
 
+// ── Cost probe (CIRCUIT_COST_PROBE=1) — READ-ONLY measurement, no behavior change ──────────────
+// Classifies the Token/Token-2022 account stream so we can size the firehose narrowing safely:
+//   vault  = account is a registered CPMM/PumpSwap vault → USED for pricing (keep)
+//   mint   = ~82-byte SPL mint → USED for circuit:mint decimals (keep)
+//   holder = everything else (~165-byte wallet token accounts) → DISCARDED today = the firehose waste
+// Byte counters use the base58 data length as a size proxy (the keep/drop RATIO is what matters).
+const COST_PROBE = process.env.CIRCUIT_COST_PROBE === '1';
+const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const TOKEN_2022_ID    = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+const cp = { acctEv: 0, acctChars: 0, tokEv: 0, vault: 0, vaultChars: 0, mintLike: 0, mintChars: 0, holder: 0, holderChars: 0 };
+
 // ── OHLCV aggregator ──────────────────────────────────────────────────────────
 
 const ohlcv = new OHLCVAggregator(async (candle) => {
@@ -184,6 +195,17 @@ async function handleEvent(event) {
 
 async function handleAccount(event) {
   stats.accounts++;
+
+  if (COST_PROBE) {
+    const len = event.data ? event.data.length : 0;
+    cp.acctEv++; cp.acctChars += len;
+    if (event.owner === TOKEN_PROGRAM_ID || event.owner === TOKEN_2022_ID) {
+      cp.tokEv++;
+      if (vaultRegistry.has(event.pubkey)) { cp.vault++; cp.vaultChars += len; }
+      else if (len < 150)                  { cp.mintLike++; cp.mintChars += len; }  // ~82-byte SPL mint
+      else                                 { cp.holder++; cp.holderChars += len; }  // ~165-byte holder = waste
+    }
+  }
 
   // ── Try Raydium AMM v4 / CLMM ─────────────────────────────────────────────
   const poolR = raydium.processAccountEvent(event);
@@ -577,6 +599,18 @@ setInterval(() => {
     errors:   stats.errors,
     eps:      (stats.events / (upMs / 1000)).toFixed(1),
   });
+  if (COST_PROBE) {
+    const pct = (a, b) => (b ? (100 * a / b).toFixed(1) + '%' : '0%');
+    Logger.info('Cost probe', {
+      tokenEvPctOfAccounts:     pct(cp.tokEv, cp.acctEv),
+      token_vault_keep:         cp.vault,
+      token_mint_keep:          cp.mintLike,
+      token_holder_DROP:        cp.holder,
+      holderBytesPctOfAllAccts: pct(cp.holderChars, cp.acctChars),          // ≈ Triton egress we'd save
+      keepBytesPctOfAllAccts:   pct(cp.vaultChars + cp.mintChars, cp.acctChars),
+      vaultRegistrySize:        vaultRegistry.size,                         // CPMM/PumpSwap pools covered
+    });
+  }
 }, 30_000);
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
