@@ -349,12 +349,17 @@ async function handleAccount(event) {
   const poolPS = pumpswap.processAccountEvent(event);
   if (poolPS) {
     stats.pools++;
-    // base_mint decimals not in pool — fetch via RPC if not already cached
-    if (!decimalsMap.has(poolPS.baseMint)) {
-      await _fetchAndCacheDecimals([poolPS.baseMint]);
-    }
-    const decBase  = decimalsMap.get(poolPS.baseMint) ?? null;
-    const decQuote = decimalsMap.get(poolPS.quoteMint) ?? 9; // WSOL = 9
+    // Decimals aren't in the PumpSwap pool account — resolve via RPC for any mint we haven't
+    // seen. Fetch BOTH mints: pools can be ordered either way (base=token/quote=WSOL, or the
+    // reverse base=WSOL/quote=token). Fetching only baseMint left the quote token's decimals
+    // unknown on reverse-ordered pools, where the old `?? 9` default (assume WSOL) mispriced
+    // them by 1000x. This was masked when the full firehose pre-populated every mint's decimals;
+    // it only surfaces under a narrowed subscription. Default to 9 ONLY for the real WSOL mint —
+    // otherwise leave null so the price is skipped (not mispriced) until decimals resolve.
+    const _needDec = [poolPS.baseMint, poolPS.quoteMint].filter((m) => !decimalsMap.has(m));
+    if (_needDec.length) await _fetchAndCacheDecimals(_needDec);
+    const decBase  = decimalsMap.get(poolPS.baseMint)  ?? (poolPS.baseMint  === SOL_MINT ? 9 : null);
+    const decQuote = decimalsMap.get(poolPS.quoteMint) ?? (poolPS.quoteMint === SOL_MINT ? 9 : null);
     const entry = {
       poolAccount: event.pubkey,
       mint0: poolPS.baseMint,
@@ -563,7 +568,9 @@ function startConsumer() {
     }
     case 'grpc': {
       const { GrpcConsumer } = require('./consumers/grpc');
-      const c = new GrpcConsumer(handleEvent);
+      // getVaults: the live registered-vault pubkey list, used ONLY in narrow mode (CIRCUIT_NARROW=1)
+      // to subscribe to specific vaults instead of all token accounts. Ignored otherwise.
+      const c = new GrpcConsumer(handleEvent, { getVaults: () => [...vaultRegistry.keys()] });
       c.start().catch(e => {
         Logger.error('gRPC consumer failed to start', { error: e.message });
         process.exit(1);

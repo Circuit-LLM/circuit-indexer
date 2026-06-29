@@ -40,13 +40,21 @@ class GrpcConsumer {
   /**
    * @param {function} onEvent - called with normalized Geyser event
    */
-  constructor(onEvent) {
+  constructor(onEvent, opts = {}) {
     this._onEvent       = onEvent;
     this._client        = null;
     this._stream        = null;
     this._running       = false;
     this._reconnecting  = false;  // guard: prevents concurrent reconnect timers
     this._reconnectTimer = null;  // current pending reconnect timer
+    // Narrowed-subscription mode (CIRCUIT_NARROW=1): subscribe to the specific registered pool VAULTS
+    // + size-filtered mints, instead of every SPL token account. getVaults() supplies the live vault
+    // pubkey list and _maybeResubscribe() re-sends the request as it grows. No-op when the flag is off
+    // (prod path unchanged), so this can ship dark and be validated by a shadow consumer first.
+    this._getVaults      = opts.getVaults || null;
+    this._narrow         = process.env.CIRCUIT_NARROW === '1' && !!this._getVaults;
+    this._lastVaultCount = -1;
+    this._resubTimer     = null;
     this._stats    = { events: 0, reconnects: 0, errors: 0, lastEventTs: null };
   }
 
@@ -118,8 +126,12 @@ class GrpcConsumer {
       // Successful subscription — reset reconnect counter so backoff starts fresh
       this._stats.reconnects = 0;
       Logger.info('GrpcConsumer: subscribed', {
-        programs: WATCHED_PROGRAMS.length,
+        programs: WATCHED_PROGRAMS.length, narrow: this._narrow,
       });
+      if (this._narrow && !this._resubTimer) {
+        this._resubTimer = setInterval(() => this._maybeResubscribe(), 8000);
+        if (this._resubTimer.unref) this._resubTimer.unref();
+      }
 
     } catch (e) {
       Logger.error('GrpcConsumer: subscription failed', { error: e.message });
@@ -130,19 +142,34 @@ class GrpcConsumer {
   _buildSubscribeRequest() {
     const { SubscribeRequest } = require('@triton-one/yellowstone-grpc/dist/grpc/geyser');
     const txWatch = (process.env.CIRCUIT_TX_WATCHLIST || '').split(',').map(s => s.trim()).filter(Boolean);
+
+    // Pool-state subscriptions (always on). dataSize filters drop the large tick-array / observation
+    // accounts these programs also own (the parsers discard those anyway). Sizes verified on-chain
+    // (CLMM PoolState 1544, Orca Whirlpool 653, PumpSwap pool 301).
+    const accounts = {
+      clmm:     { account: [], owner: ['CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'], filters: [{ datasize: 1544 }] },
+      orca:     { account: [], owner: ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'],  filters: [{ datasize: 653 }] },
+      pumpswap: { account: [], owner: ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'], filters: [{ datasize: 301 }] },
+    };
+    if (this._narrow) {
+      // CPMM + Pump.fun pool states stay (they populate the vault registry). Replace the unfiltered
+      // Token/Token-2022 owner with: (a) the specific registered VAULTS — exactly what produces prices
+      // today — and (b) mints only (82-byte) for metadata. This is the firehose cut. The vault list is
+      // grown by _maybeResubscribe() as new pools register their vaults.
+      accounts.cpmmpf = { account: [], owner: ['CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], filters: [] };
+      accounts.mints  = { account: [], owner: ['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'], filters: [{ datasize: 82 }] };
+      const vaults = (this._getVaults && this._getVaults()) || [];
+      this._lastVaultCount = vaults.length;
+      if (vaults.length) accounts.vaults = { account: vaults, owner: [], filters: [] };
+    } else {
+      // CPMM pool config + Pump.fun bonding curves are small (left unfiltered). Token/Token-2022 are
+      // kept UNFILTERED here for CPMM/PumpSwap vault balances (the firehose narrowed away above when
+      // CIRCUIT_NARROW=1).
+      accounts.rest = { account: [], owner: ['CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'], filters: [] };
+    }
+
     return SubscribeRequest.fromPartial({
-      accounts: {
-        // Pool-state accounts only. dataSize filters drop the large tick-array / observation
-        // accounts these programs also own — the parsers already discard those (size check),
-        // so we were paying to receive ~31MB/45s of data we threw away. Sizes verified on-chain
-        // (CLMM PoolState 1544, Orca Whirlpool 653, PumpSwap pool 301).
-        clmm:     { account: [], owner: ['CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'], filters: [{ datasize: 1544 }] },
-        orca:     { account: [], owner: ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'],  filters: [{ datasize: 653 }] },
-        pumpswap: { account: [], owner: ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'], filters: [{ datasize: 301 }] },
-        // CPMM pool config + Pump.fun bonding curves are small (left unfiltered). Token/Token-2022
-        // are kept for CPMM/PumpSwap vault balances — narrowed to specific vaults in a later step.
-        rest:     { account: [], owner: ['CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'], filters: [] },
-      },
+      accounts,
       // Scoped transaction stream (surgical 1d-c reversal). The full firehose was dropped because
       // transactions were ~76% of it (~$13.9/day), but deriving candles from vault-balance deltas
       // undercounts trades that share a slot (Geyser emits net per-slot state), so low-volume tokens
@@ -160,6 +187,22 @@ class GrpcConsumer {
       commitment:        1, // Confirmed
       accountsDataSlice: [],
     });
+  }
+
+  // Re-send the subscription when the vault registry has grown (narrow mode only). yellowstone
+  // replaces the active subscription on each SubscribeRequest, so this just widens the vault set.
+  _maybeResubscribe() {
+    if (!this._running || !this._stream || !this._narrow) return;
+    const n = ((this._getVaults && this._getVaults()) || []).length;
+    if (n === this._lastVaultCount) return; // nothing new registered since last subscribe
+    try {
+      this._stream.write(this._buildSubscribeRequest(), (err) => {
+        if (err) Logger.warn('GrpcConsumer: vault re-subscribe failed', { error: err.message });
+        else     Logger.info('GrpcConsumer: re-subscribed', { vaults: n });
+      });
+    } catch (e) {
+      Logger.warn('GrpcConsumer: vault re-subscribe threw', { error: e.message });
+    }
   }
 
   _handleGrpcEvent(data) {
@@ -277,6 +320,10 @@ class GrpcConsumer {
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
+    }
+    if (this._resubTimer) {
+      clearInterval(this._resubTimer);
+      this._resubTimer = null;
     }
     if (this._stream) {
       try { this._stream.cancel?.(); this._stream.end?.(); } catch {}
