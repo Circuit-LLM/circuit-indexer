@@ -253,10 +253,43 @@ async function disconnect() {
   if (_client) { await _client.quit(); _client = null; }
 }
 
+// ── Vault registry persistence ──────────────────────────────────────────────────
+// The in-memory vaultRegistry rebuilds from ~zero over ~1.5h after a restart (CPMM/PumpSwap pool-state
+// accounts stream slowly), degrading pricing + discovery coverage for that whole window. Mirror it to a
+// Redis hash so a restart rehydrates it instantly. Dead pools emit ~no vault updates, so the larger
+// subscription costs ~nothing in Triton egress.
+const VAULT_REGISTRY_KEY = 'circuit:vault-registry';
+
+async function saveVaultEntry(vault, entry) {
+  const r = await getClient();
+  if (!r) return;
+  try { await r.hset(VAULT_REGISTRY_KEY, vault, JSON.stringify(entry)); } catch {}
+}
+
+async function loadVaultRegistry() {
+  const r = await getClient();
+  if (!r) return [];
+  try {
+    const h = await r.hgetall(VAULT_REGISTRY_KEY);
+    return Object.entries(h)
+      .map(([v, j]) => { try { return [v, JSON.parse(j)]; } catch { return null; } })
+      .filter(Boolean);
+  } catch { return []; }
+}
+
+// Drop pruned (long-dead) vaults from the persisted registry so the hash stays bounded.
+async function removeVaultEntries(vaults) {
+  if (!vaults || !vaults.length) return;
+  const r = await getClient();
+  if (!r) return;
+  try { await r.hdel(VAULT_REGISTRY_KEY, ...vaults); } catch {}
+}
+
 module.exports = {
   writePrice, writePriceSol, writePool, writePoolByMint, writeMint,
   updateTrending, appendPriceHistory, writeCandleBuffer,
   getPrice, getPriceSol, getPool, getPoolByMint, getMint,
   getTrending, getPriceHistory, getCandles,
+  saveVaultEntry, loadVaultRegistry, removeVaultEntries,
   disconnect,
 };

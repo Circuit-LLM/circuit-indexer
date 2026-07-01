@@ -137,6 +137,20 @@ async function _writeSolUsd(priceUsd, source) {
 // CPMM vault registry: vault_pubkey → { poolAccount, isVault0, mint0, mint1, dec0, dec1 }
 // Populated when we see CPMM pool state accounts; used to compute price on vault updates.
 const vaultRegistry = new Map();
+// Register a vault in-memory AND persist it to Redis so the registry — and thus pricing/discovery
+// coverage + the narrow Triton subscription — survives restarts instead of rebuilding from ~zero over
+// ~1.5h. Persist is fire-and-forget; a miss just means that pool re-registers when it next streams.
+// Prune long-dead pools so the registry/hash + narrow Triton subscription stay bounded. Conservative
+// default (no vault activity in 24h); active pools trade far more often, so they're never pruned.
+// Env-overridable (CIRCUIT_VAULT_MAX_IDLE_MIN / CIRCUIT_VAULT_SWEEP_MIN) for testing.
+const VAULT_MAX_IDLE_MS = (Number(process.env.CIRCUIT_VAULT_MAX_IDLE_MIN) || 1440) * 60_000;
+const VAULT_SWEEP_MS    = (Number(process.env.CIRCUIT_VAULT_SWEEP_MIN)    || 60)   * 60_000;
+
+function registerVault(vault, entry) {
+  entry.lastActive = Date.now();
+  vaultRegistry.set(vault, entry);
+  redis.saveVaultEntry(vault, entry).catch(() => {});
+}
 
 // Pending decimals fetches to avoid duplicate concurrent lookups
 const _pendingDecimalsFetch = new Set();
@@ -351,8 +365,8 @@ async function handleAccount(event) {
     const dec0 = poolC.dec0 ?? decimalsMap.get(poolC.mint0) ?? null;
     const dec1 = poolC.dec1 ?? decimalsMap.get(poolC.mint1) ?? null;
     const entry = { poolAccount: event.pubkey, mint0: poolC.mint0, mint1: poolC.mint1, dec0, dec1, poolType: 'raydium-cpmm' };
-    vaultRegistry.set(poolC.vault0, { ...entry, isVault0: true,  pairedVault: poolC.vault1 });
-    vaultRegistry.set(poolC.vault1, { ...entry, isVault0: false, pairedVault: poolC.vault0 });
+    registerVault(poolC.vault0, { ...entry, isVault0: true,  pairedVault: poolC.vault1 });
+    registerVault(poolC.vault1, { ...entry, isVault0: false, pairedVault: poolC.vault0 });
     await redis.writePool(event.pubkey, poolC);
     return;
   }
@@ -380,8 +394,8 @@ async function handleAccount(event) {
       dec1:  decQuote,
       poolType: 'pumpswap',
     };
-    vaultRegistry.set(poolPS.baseVault,  { ...entry, isVault0: true,  pairedVault: poolPS.quoteVault });
-    vaultRegistry.set(poolPS.quoteVault, { ...entry, isVault0: false, pairedVault: poolPS.baseVault  });
+    registerVault(poolPS.baseVault,  { ...entry, isVault0: true,  pairedVault: poolPS.quoteVault });
+    registerVault(poolPS.quoteVault, { ...entry, isVault0: false, pairedVault: poolPS.baseVault  });
     await redis.writePool(event.pubkey, { ...poolPS, poolType: 'pumpswap' });
     // baseMint = token, quoteMint = WSOL (or USDC on USD-quoted pools). Index the TOKEN → pool
     // mapping, and only when the quote is SOL so this pool can yield a SOL price. NEVER index the
@@ -398,13 +412,32 @@ async function handleAccount(event) {
   if (event.owner === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' ||
       event.owner === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb') {
     const reg = vaultRegistry.get(event.pubkey);
+    if (reg) reg.lastActive = event.ts || Date.now(); // mark activity — keeps live pools from being swept
     if (reg && reg.dec0 !== null && reg.dec1 !== null) {
       try {
         const vaultBuf = toBuf(event.data);
         if (vaultBuf.length >= 72) {
           const balance = Number(vaultBuf.readBigUInt64LE(64)); // SPL token balance at offset 64
-          // Fetch the other vault's last known balance from Redis
-          const poolData = await redis.getPool(reg.poolAccount);
+          // Fetch the other vault's last known balance from Redis. Raydium CPMM stores price in its
+          // VAULTS, not the pool-state account, so (unlike CLMM/Orca whose pool account changes every
+          // swap) the CPMM pool-state account rarely updates — the 60s pool record expires and, gated
+          // on `if (poolData)`, was never rebuilt. That silently stopped CPMM PRICING and removed CPMM
+          // pools from Redis discovery. When the record has expired, reconstruct a base record from the
+          // vault registry (which holds mints/decimals/vault addresses); the paired vault balance
+          // self-heals on the next update, restoring both pricing and discovery.
+          let poolData = await redis.getPool(reg.poolAccount);
+          if (!poolData) {
+            poolData = {
+              poolAccount: reg.poolAccount,
+              type:        reg.poolType || 'raydium-cpmm',
+              mint0:       reg.mint0,
+              mint1:       reg.mint1,
+              dec0:        reg.dec0,
+              dec1:        reg.dec1,
+              vault0:      reg.isVault0 ? event.pubkey : reg.pairedVault,
+              vault1:      reg.isVault0 ? reg.pairedVault : event.pubkey,
+            };
+          }
           if (poolData) {
             let amt0, amt1;
             if (reg.isVault0) {
@@ -632,6 +665,24 @@ setInterval(() => {
   }
 }, 30_000);
 
+// ── Registry prune sweep ────────────────────────────────────────────────────────
+// Drop pools with no vault activity in VAULT_MAX_IDLE_MS from the in-memory registry AND the Redis hash,
+// so the registry (and the narrow Triton subscription it drives) stays bounded as dead pump.fun tokens
+// accumulate. Conservative — live pools trade far more often than 24h, and the shrink triggers a
+// re-subscribe that drops the pruned vaults from the Geyser stream.
+setInterval(() => {
+  const now = Date.now();
+  const dead = [];
+  for (const [v, e] of vaultRegistry) {
+    if (now - (e.lastActive ?? now) > VAULT_MAX_IDLE_MS) dead.push(v);
+  }
+  if (dead.length) {
+    for (const v of dead) vaultRegistry.delete(v);
+    redis.removeVaultEntries(dead).catch(() => {});
+    Logger.info('vault registry swept', { pruned: dead.length, remaining: vaultRegistry.size });
+  }
+}, VAULT_SWEEP_MS).unref();
+
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
 async function shutdown(signal) {
@@ -646,5 +697,18 @@ process.on('SIGINT',  () => shutdown('SIGINT'));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-Logger.info('circuit-indexer starting', { consumer: CONSUMER });
-startConsumer();
+(async () => {
+  Logger.info('circuit-indexer starting', { consumer: CONSUMER });
+  // Rehydrate the vault registry from Redis BEFORE subscribing so coverage (pricing + discovery + the
+  // narrow Triton vault subscription) is restored instantly on restart, instead of rebuilding from ~zero
+  // over ~1.5h — which degrades data for live agents that whole window.
+  try {
+    const saved = await redis.loadVaultRegistry();
+    const grace = Date.now(); // grace period: give rehydrated pools a full idle window to prove activity
+    for (const [v, e] of saved) { e.lastActive = grace; vaultRegistry.set(v, e); }
+    if (saved.length) Logger.info('vault registry rehydrated from Redis', { count: vaultRegistry.size });
+  } catch (e) {
+    Logger.warn('vault registry rehydrate failed — will rebuild from stream', { error: e.message });
+  }
+  startConsumer();
+})();
