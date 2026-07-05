@@ -30,7 +30,10 @@ const bs58 = require('bs58').default ?? require('bs58');
 const { toBuf } = require('../lib/databuf');
 
 const ORCA_WHIRLPOOL_PROGRAM = 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc';
-const WHIRLPOOL_SIZE         = 653;
+const WHIRLPOOL_SIZE         = 653;          // full on-chain size (datasize filter uses this)
+// Parse guard = max byte the whirlpool parser reads (TOKEN_MINT_B end, byte 213). Relaxed from
+// WHIRLPOOL_SIZE so an accountsDataSlice prefix (≥213B, after the 8-byte discriminator) parses.
+const WHIRLPOOL_MIN_READ     = 213;
 
 const WP = {
   DISCRIMINATOR:      0,
@@ -64,7 +67,7 @@ function whirlpoolPrice(sqrtPriceX64, decimalsA, decimalsB) {
 }
 
 function parseWhirlpool(buf, decimalsA = null, decimalsB = null) {
-  if (buf.length < WHIRLPOOL_SIZE) return null;
+  if (buf.length < WHIRLPOOL_MIN_READ) return null;
   if (!buf.slice(0, 8).equals(WHIRLPOOL_DISCRIMINATOR)) return null;
 
   try {

@@ -36,6 +36,17 @@ const WATCHED_PROGRAMS = [
   'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',  // Token-2022
 ];
 
+// Named program owners for the multi-stream sliced mode (CIRCUIT_STREAM_SLICING=1).
+const PROG = {
+  CLMM:  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
+  CPMM:  'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
+  ORCA:  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
+  PUMP:  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  PSWAP: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+  TOK:   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  TOK22: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+};
+
 class GrpcConsumer {
   /**
    * @param {function} onEvent - called with normalized Geyser event
@@ -87,7 +98,14 @@ class GrpcConsumer {
       'grpc.default_compression_algorithm': 2, // gzip — request a compressed stream to cut egress bytes (Triton bills wire volume)
     });
 
-    await this._subscribe();
+    // Multi-stream sliced mode: partition the subscription into per-slice-tier streams so each
+    // account type streams at only the prefix its parser reads. Requires narrow mode (vault list).
+    // Default (flag off) → the original single stream, unchanged.
+    if (process.env.CIRCUIT_STREAM_SLICING === '1' && this._narrow) {
+      await this._startMulti();
+    } else {
+      await this._subscribe();
+    }
   }
 
   async _subscribe() {
@@ -185,8 +203,118 @@ class GrpcConsumer {
       blocks:            {},
       blocksMeta:        {},
       commitment:        1, // Confirmed
-      accountsDataSlice: [],
+      // Egress optimization: stream only the prefix each parser reads (global per stream).
+      // CIRCUIT_ACCT_SLICE=<bytes> (e.g. 333) trims CLMM/CPMM/Orca to their read length; smaller
+      // accounts (vault/pump.fun/PumpSwap/mint) are already ≤ the slice, so untouched. Unset/0 = full
+      // account (current behavior). Requires the CLMM (273) + Orca (213) guard relaxations in parsers/.
+      accountsDataSlice: this._acctSlice(),
     });
+  }
+
+  // Global accountsDataSlice from env — [] when unset (byte-for-byte current behavior).
+  _acctSlice() {
+    const n = Number(process.env.CIRCUIT_ACCT_SLICE);
+    return n > 0 ? [{ offset: '0', length: String(n) }] : [];
+  }
+
+  // ── Multi-stream sliced mode (CIRCUIT_STREAM_SLICING=1) ──────────────────────────────────────
+  // Triton's accountsDataSlice DROPS any account shorter than the slice, so a single global slice is
+  // impossible. Instead split into per-tier streams, each sliced to the max byte its parsers read
+  // (which is ≤ its smallest account): A=vaults+pump.fun@72, B=PumpSwap+Orca@215, C=CLMM+CPMM@333
+  // (+slots+tx), D=mints unsliced. Every stream reconnects independently and feeds one _handleGrpcEvent.
+  _buildReq(accounts, slice, { slots = false, tx = false } = {}) {
+    const { SubscribeRequest } = require('@triton-one/yellowstone-grpc/dist/grpc/geyser');
+    const txWatch = (process.env.CIRCUIT_TX_WATCHLIST || '').split(',').map(s => s.trim()).filter(Boolean);
+    return SubscribeRequest.fromPartial({
+      accounts,
+      transactions: (tx && txWatch.length)
+        ? { circuit: { vote: false, failed: false, accountInclude: txWatch, accountExclude: [], accountRequired: [] } }
+        : {},
+      slots:      slots ? { circuit: {} } : {},
+      blocks:     {},
+      blocksMeta: {},
+      commitment: 1,
+      accountsDataSlice: slice > 0 ? [{ offset: '0', length: String(slice) }] : [],
+    });
+  }
+
+  _streamSpecs() {
+    const vaults = () => (this._getVaults && this._getVaults()) || [];
+    return [
+      { name: 'A-small', slice: 72,  resub: true,  build: () => this._buildReq({
+          vaults:  { account: vaults(), owner: [],           filters: [] },
+          pumpfun: { account: [],       owner: [PROG.PUMP],  filters: [] },
+        }, 72) },
+      { name: 'B-mid',   slice: 215, resub: false, build: () => this._buildReq({
+          pumpswap: { account: [], owner: [PROG.PSWAP], filters: [{ datasize: 301 }] },
+          orca:     { account: [], owner: [PROG.ORCA],  filters: [{ datasize: 653 }] },
+        }, 215) },
+      { name: 'C-pool',  slice: 333, resub: false, build: () => this._buildReq({
+          clmm: { account: [], owner: [PROG.CLMM], filters: [{ datasize: 1544 }] },
+          cpmm: { account: [], owner: [PROG.CPMM], filters: [] },
+        }, 333, { slots: true, tx: true }) },   // slots + tx-watchlist ride here (slice ignores them)
+      { name: 'D-mints', slice: 0,   resub: false, build: () => this._buildReq({
+          mints: { account: [], owner: [PROG.TOK, PROG.TOK22], filters: [{ datasize: 82 }] },
+        }, 0) },
+    ];
+  }
+
+  async _startMulti() {
+    this._handles = this._streamSpecs().map(spec => ({ spec, stream: null, reconnecting: false, reconnectTimer: null, resubTimer: null, attempt: 0 }));
+    for (const h of this._handles) await this._subscribeStream(h);
+    Logger.info('GrpcConsumer: multi-stream sliced mode', { streams: this._handles.map(h => `${h.spec.name}@${h.spec.slice || 'full'}`) });
+  }
+
+  async _subscribeStream(h) {
+    if (!this._running) return;
+    try {
+      const stream = await this._client.subscribe();
+      h.stream = stream;
+      stream.on('data', (data) => {
+        this._stats.lastEventTs = Date.now();
+        try { this._handleGrpcEvent(data, stream); }
+        catch (e) { this._stats.errors++; Logger.error('GrpcConsumer: event handler error', { stream: h.spec.name, error: e.message }); }
+      });
+      stream.on('error', (e) => { Logger.warn('GrpcConsumer: stream error', { stream: h.spec.name, error: e.message }); this._reconnectStream(h); });
+      stream.on('end',   ()  => { Logger.warn('GrpcConsumer: stream ended', { stream: h.spec.name }); this._reconnectStream(h); });
+      await new Promise((res, rej) => stream.write(h.spec.build(), (err) => err ? rej(err) : res()));
+      h.attempt = 0;
+      if (h.spec.resub) {
+        this._lastVaultCount = ((this._getVaults && this._getVaults()) || []).length;
+        if (!h.resubTimer) {
+          h.resubTimer = setInterval(() => this._maybeResubStream(h), 8000);
+          if (h.resubTimer.unref) h.resubTimer.unref();
+        }
+      }
+      Logger.info('GrpcConsumer: stream subscribed', { stream: h.spec.name, slice: h.spec.slice || 'full' });
+    } catch (e) {
+      Logger.error('GrpcConsumer: stream subscribe failed', { stream: h.spec.name, error: e.message });
+      this._reconnectStream(h);
+    }
+  }
+
+  _reconnectStream(h) {
+    if (!this._running || h.reconnecting) return;   // per-stream single-timer guard
+    h.reconnecting = true;
+    if (h.stream) { try { h.stream.cancel?.(); h.stream.end?.(); } catch {} h.stream = null; }
+    h.attempt = (h.attempt || 0) + 1;
+    this._stats.reconnects++;
+    const delay = Math.min(1000 * Math.pow(2, Math.min(h.attempt - 1, 6)), 60_000);
+    Logger.info('GrpcConsumer: stream reconnecting', { stream: h.spec.name, delay, attempt: h.attempt });
+    h.reconnectTimer = setTimeout(() => { h.reconnecting = false; h.reconnectTimer = null; this._subscribeStream(h); }, delay);
+  }
+
+  _maybeResubStream(h) {
+    if (!this._running || !h.stream) return;
+    const n = ((this._getVaults && this._getVaults()) || []).length;
+    if (n === this._lastVaultCount) return;
+    this._lastVaultCount = n;
+    try {
+      h.stream.write(h.spec.build(), (err) => {
+        if (err) Logger.warn('GrpcConsumer: stream re-subscribe failed', { stream: h.spec.name, error: err.message });
+        else     Logger.info('GrpcConsumer: stream re-subscribed', { stream: h.spec.name, vaults: n });
+      });
+    } catch (e) { Logger.warn('GrpcConsumer: stream re-subscribe threw', { stream: h.spec.name, error: e.message }); }
   }
 
   // Re-send the subscription when the vault registry has grown (narrow mode only). yellowstone
@@ -205,7 +333,7 @@ class GrpcConsumer {
     }
   }
 
-  _handleGrpcEvent(data) {
+  _handleGrpcEvent(data, stream = null) {
     this._stats.events++;
 
     // yellowstone-grpc uses oneof field in the protobuf message
@@ -274,11 +402,13 @@ class GrpcConsumer {
       });
 
     } else if (data.ping) {
-      // Keepalive ping — respond with pong (write() takes a callback, not a Promise)
-      if (this._stream) {
+      // Keepalive ping — respond with pong on the SAME stream that sent it (multi-stream: `stream`;
+      // single-stream: this._stream). write() takes a callback, not a Promise.
+      const s = stream || this._stream;
+      if (s) {
         const { SubscribeRequest } = require('@triton-one/yellowstone-grpc/dist/grpc/geyser');
         const pong = SubscribeRequest.fromPartial({ ping: { id: data.ping.id } });
-        this._stream.write(pong, (err) => {
+        s.write(pong, (err) => {
           if (err) Logger.warn('GrpcConsumer: pong write failed', { error: err.message });
         });
       }
@@ -328,6 +458,15 @@ class GrpcConsumer {
     if (this._stream) {
       try { this._stream.cancel?.(); this._stream.end?.(); } catch {}
       this._stream = null;
+    }
+    // Multi-stream mode: tear down every per-stream handle (timers + streams).
+    if (this._handles) {
+      for (const h of this._handles) {
+        if (h.reconnectTimer) clearTimeout(h.reconnectTimer);
+        if (h.resubTimer)     clearInterval(h.resubTimer);
+        if (h.stream) { try { h.stream.cancel?.(); h.stream.end?.(); } catch {} h.stream = null; }
+      }
+      this._handles = null;
     }
   }
 

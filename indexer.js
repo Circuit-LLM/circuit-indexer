@@ -72,7 +72,15 @@ const stats = {
 const COST_PROBE = process.env.CIRCUIT_COST_PROBE === '1';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_ID    = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
-const cp = { acctEv: 0, acctChars: 0, tokEv: 0, vault: 0, vaultChars: 0, mintLike: 0, mintChars: 0, holder: 0, holderChars: 0 };
+// Pool-program owners — for per-program egress attribution in the cost probe (Move A/B sizing).
+const CLMM_OWNER  = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
+const ORCA_OWNER  = 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc';
+const PSWAP_OWNER = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
+const CPMM_OWNER  = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
+const PUMP_OWNER  = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+const cp = { acctEv: 0, acctChars: 0, tokEv: 0, vault: 0, vaultChars: 0, mintLike: 0, mintChars: 0, holder: 0, holderChars: 0,
+  // per-program byte attribution + projected slice savings (bytes we'd STOP receiving under a slice)
+  progBytes: {}, sliceA_saved: 0, sliceB_saved: 0 };
 
 // ── OHLCV aggregator ──────────────────────────────────────────────────────────
 
@@ -225,6 +233,18 @@ async function handleAccount(event) {
   if (COST_PROBE) {
     const len = event.data ? event.data.length : 0;
     cp.acctEv++; cp.acctChars += len;
+    // per-program egress attribution + projected slice savings (added for Move A/B sizing) ──────
+    const _o = event.owner;
+    const _isVault = (_o === TOKEN_PROGRAM_ID || _o === TOKEN_2022_ID) && vaultRegistry.has(event.pubkey);
+    const _b = _o === CLMM_OWNER ? 'clmm' : _o === ORCA_OWNER ? 'orca' : _o === PSWAP_OWNER ? 'pumpswap'
+             : _o === CPMM_OWNER ? 'cpmm' : _o === PUMP_OWNER ? 'pumpfun'
+             : _isVault ? 'token-vault'
+             : (_o === TOKEN_PROGRAM_ID || _o === TOKEN_2022_ID) ? (len < 150 ? 'token-mint' : 'token-holder')
+             : 'other';
+    cp.progBytes[_b] = (cp.progBytes[_b] || 0) + len;
+    if (len > 333) cp.sliceA_saved += len - 333;                       // Move A: global slice → 333
+    if ((_o === PUMP_OWNER || _isVault) && len > 72) cp.sliceB_saved += len - 72; // Move B: pumpfun+vault → 72
+    // ───────────────────────────────────────────────────────────────────────────────────────────
     if (event.owner === TOKEN_PROGRAM_ID || event.owner === TOKEN_2022_ID) {
       cp.tokEv++;
       if (vaultRegistry.has(event.pubkey)) { cp.vault++; cp.vaultChars += len; }
@@ -661,6 +681,15 @@ setInterval(() => {
       holderBytesPctOfAllAccts: pct(cp.holderChars, cp.acctChars),          // ≈ Triton egress we'd save
       keepBytesPctOfAllAccts:   pct(cp.vaultChars + cp.mintChars, cp.acctChars),
       vaultRegistrySize:        vaultRegistry.size,                         // CPMM/PumpSwap pools covered
+    });
+    // per-program egress share + projected slice savings (Move A = 333 global; Move B = +72 on pumpfun/vault)
+    const share = {};
+    for (const [k, v] of Object.entries(cp.progBytes).sort((a, b) => b[1] - a[1])) share[k] = pct(v, cp.acctChars);
+    Logger.info('Cost probe: per-program egress', {
+      bytesShare:            share,
+      projMoveA_saved:       pct(cp.sliceA_saved, cp.acctChars),                       // global slice → 333
+      projMoveB_extra_saved: pct(cp.sliceB_saved, cp.acctChars),                       // pumpfun+vault → 72
+      projCombined_saved:    pct(cp.sliceA_saved + cp.sliceB_saved, cp.acctChars),
     });
   }
 }, 30_000);

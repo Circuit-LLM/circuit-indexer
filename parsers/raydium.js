@@ -20,7 +20,11 @@ const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const RAYDIUM_CLMM   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
 
 const AMM_INFO_SIZE  = 752;
-const CLMM_POOL_SIZE = 1544;
+const CLMM_POOL_SIZE = 1544;                 // full on-chain size (datasize filter uses this)
+// Parse guard = the max byte the CLMM parser actually reads (TICK_CURRENT end, byte 273). Relaxed
+// from CLMM_POOL_SIZE so an accountsDataSlice prefix (≥273B) still parses; full 1544B accounts pass too.
+const CLMM_MIN_READ  = 273;
+const AMM_MIN_READ   = 328;                  // Raydium AMM v4 max read (PC_MINT end); AMM v4 is not subscribed today
 
 // ── AMM v4 — AmmInfo layout offsets ──────────────────────────────────────────
 const AMM = {
@@ -72,7 +76,7 @@ function clmmPrice(sqrtPriceX64, decimals0, decimals1) {
 // ── Parsers ───────────────────────────────────────────────────────────────────
 
 function parseAmmV4(buf) {
-  if (buf.length < AMM_INFO_SIZE) return null;
+  if (buf.length < AMM_MIN_READ) return null;
   try {
     const status = buf.readBigUInt64LE(AMM.STATUS);
     // Only parse initialized pools (status == 6 or 7)
@@ -102,7 +106,7 @@ function parseAmmV4(buf) {
 }
 
 function parseClmm(buf) {
-  if (buf.length < CLMM_POOL_SIZE) return null;
+  if (buf.length < CLMM_MIN_READ) return null;
   try {
     const decimals0 = buf.readUInt8(CLMM.MINT_DECIMALS_0);
     const decimals1 = buf.readUInt8(CLMM.MINT_DECIMALS_1);

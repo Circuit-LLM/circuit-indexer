@@ -22,7 +22,10 @@ const { toBuf } = require('../lib/databuf');
 
 const PUMPSWAP_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
 const DISCRIMINATOR    = Buffer.from('f19a6d0411b16dbc', 'hex');
-const POOL_SIZE        = 301;
+const POOL_SIZE        = 301;                // full on-chain size (datasize filter uses this)
+// Parse guard = max byte the parser reads (QUOTE_VAULT end, byte 203). Relaxed from POOL_SIZE so an
+// accountsDataSlice prefix (≥203B, e.g. Stream B's 215) still parses. Full 301B accounts pass too.
+const POOL_MIN_READ    = 203;
 
 const OFFSETS = {
   BASE_MINT:   43,   // 32 bytes — non-SOL token mint
@@ -32,7 +35,7 @@ const OFFSETS = {
 };
 
 function parsePumpswap(buf) {
-  if (buf.length < POOL_SIZE) return null;
+  if (buf.length < POOL_MIN_READ) return null;
   try {
     if (!buf.slice(0, 8).equals(DISCRIMINATOR)) return null;
 
