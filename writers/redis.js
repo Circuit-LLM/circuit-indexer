@@ -5,7 +5,7 @@
 //   circuit:price-sol:{mint}      STRING  JSON SOL price record, TTL 120s (SOL-quoted pools)
 //   circuit:pool:{poolAccount}    STRING  JSON pool state, TTL 60s
 //   circuit:pool-by-mint:{mint}   STRING  poolAccount address, TTL 120s (reverse index)
-//   circuit:mint:{mint}           STRING  JSON mint metadata, no TTL (stable)
+//   circuit:mint:{mint}           STRING  JSON mint metadata, TTL 14d (hot cache; durable copy in Postgres `tokens`)
 //   circuit:trending              ZSET    score=accumulated volume (SOL), member=mint
 //   circuit:ph:{mint}             LIST    price history ring buffer, max 300 entries, TTL 24h
 //                                         each entry: JSON {p, ts} (priceSol, unix ms)
@@ -30,6 +30,13 @@ const POOL_BY_MINT_TTL = 86400; // seconds — reverse index (24h: pool addresse
 // Price history ring buffer config
 const PH_MAX_ENTRIES   = 300;   // ~5 min at 1 tick/sec for active pools
 const PH_TTL           = 86400; // 24h TTL
+
+// Mint metadata cache TTL. Immutable on-chain data with a durable copy in Postgres `tokens`
+// (data-api falls back to it), so this only bounds the hot cache. writeMint runs on every
+// trade/registration, so any actively- or occasionally-traded token keeps refreshing its TTL;
+// only long-dead tokens expire. Caps circuit:mint growth (the only unbounded key class) below
+// the Redis maxmemory ceiling. 14d comfortably covers the active working set.
+const MINT_TTL         = 14 * 86400; // 14 days
 
 // Candle ring buffer config (max entries per window, TTL seconds)
 const CANDLE_CFG = {
@@ -89,8 +96,8 @@ async function writePool(poolAccount, poolState) {
 async function writeMint(mint, mintData) {
   const r = await getClient();
   if (!r) return;
-  // Mint metadata is stable — no TTL
-  await r.set(`circuit:mint:${mint}`, JSON.stringify({
+  // 14d TTL, refreshed on every write; durable copy lives in Postgres `tokens` (see MINT_TTL).
+  await r.setex(`circuit:mint:${mint}`, MINT_TTL, JSON.stringify({
     ...mintData,
     indexedAt: Date.now(),
   }));
