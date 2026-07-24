@@ -2,10 +2,10 @@
 
 # circuit-indexer
 
-**Consumes a Geyser event stream, parses Raydium, Orca, and PumpSwap pool state and swap transactions, and writes real-time prices and OHLCV candles to Redis. The parsing layer that turns the raw on-chain firehose into the hot data the Circuit stack serves.**
+**Consumes a Triton/Yellowstone Geyser stream, parses Raydium (AMM/CLMM/CPMM), Orca, PumpSwap, and Pump.fun pool state and swap transactions, and writes real-time prices and OHLCV candles to Redis. The parsing layer that turns the raw on-chain firehose into the hot data the whole Circuit stack serves.**
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
-[![Version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/Circuit-LLM/circuit-indexer/releases)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue)](https://github.com/Circuit-LLM/circuit-indexer/releases)
 [![Status](https://img.shields.io/badge/status-beta-orange)](https://github.com/Circuit-LLM/circuit-indexer)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -23,10 +23,11 @@
 
 ## What it does
 
-- **Parses** Raydium AMM v4, Raydium CLMM, Orca Whirlpool, and PumpSwap pool account updates into structured price/pool records.
+- **Parses** Raydium CLMM, Raydium CPMM, Orca Whirlpool, PumpSwap, and Pump.fun bonding-curve pool updates into structured price/pool records. (A Raydium AMM v4 parser exists but isn't subscribed in the gRPC path.)
 - **Tracks swap transactions** — extracts buy/sell direction and SOL volume from token balance deltas and fires them into the OHLCV aggregator with accurate b/s counts.
-- **Tracks token mint metadata** — decimals, supply, and authorities.
-- **Writes hot data to Redis** with short TTLs for low-latency reads by circuit-price-feed.
+- **Tracks token mint metadata** — decimals, supply, and authorities (via `parsers/token.js`), with RPC gap-fill under `CIRCUIT_NARROW`.
+- **Derives its own SOL/USD oracle** on-chain from the project's SOL/USDC pool — no external price oracle.
+- **Writes hot data to Redis** with short TTLs for low-latency reads by circuit-price-feed, circuit-node, and circuit-data-api.
 - **Writes OHLCV candles** to Redis ring buffers (1m/5m/1h/1d) with buy/sell counts — consumed by the scan route for on-chain dip discovery.
 - **Three input modes** — file (from circuit-geyser), stdin (piped from test-validator), or gRPC (managed Geyser endpoint).
 
@@ -36,7 +37,7 @@
 
 ```
 [circuit-geyser .so]          [Managed Geyser gRPC]
-     │  Redis Stream                    │  Triton / Helius / QuickNode
+     │  JSONL file / stdin              │  Triton One (Yellowstone)
      └──────────────┬───────────────────┘
                     ▼
             circuit-indexer
@@ -44,12 +45,14 @@
             ├─ Redis: circuit:price-sol:{mint}         (SOL price, TTL 120s)
             ├─ Redis: circuit:pool:{account}           (pool state, TTL 60s)
             ├─ Redis: circuit:pool-by-mint:{mint}      (reverse index, TTL 24h)
-            ├─ Redis: circuit:mint:{mint}              (mint metadata, no TTL)
+            ├─ Redis: circuit:mint:{mint}              (mint metadata, TTL 14d)
             ├─ Redis: circuit:trending                 (ZSET, accumulated SOL volume)
             ├─ Redis: circuit:candles:{window}:{mint}  (ring buffer, 1m/5m/1h/1d)
-            └─ Redis: circuit:ph:{mint}                (price history ticks, TTL 24h)
+            ├─ Redis: circuit:ph:{mint}                (price history ticks, TTL 24h)
+            └─ Redis: circuit:vault-registry           (HASH, pool-vault registry, persisted)
                     ▼
-            circuit-price-feed (serves /price, /candles, /losers, /trending)
+            read by circuit-price-feed, circuit-node, and circuit-data-api
+            (prices, candles, trending, pools, registry)
 ```
 
 ---
@@ -104,6 +107,7 @@ All configuration is via environment variables:
 |---|---|---|
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection string |
 | `DATABASE_URL` | `postgresql://localhost/circuit_index` | Postgres connection string |
+| `CIRCUIT_RPC_URL` | — | Supplemental Solana RPC for mint-decimals / metadata gap-fills |
 | `GEYSER_FILE` | `/tmp/circuit-geyser.jsonl` | Input file path (file consumer) |
 | `GEYSER_ENDPOINT` | — | gRPC endpoint URL (grpc consumer) |
 | `GEYSER_TOKEN` | — | gRPC access token (grpc consumer) |
@@ -173,50 +177,55 @@ This cuts the account stream by ~⅔ (holder accounts are no longer received) wi
 | `circuit:price-sol:{mint}` | STRING | 120s | SOL price record (SOL-quoted pools) |
 | `circuit:pool:{account}` | STRING | 60s | Full pool state |
 | `circuit:pool-by-mint:{mint}` | STRING | 24h | Reverse index — pool account address (pool addresses never change) |
-| `circuit:mint:{mint}` | STRING | none | Mint metadata (decimals, supply, authorities) |
+| `circuit:mint:{mint}` | STRING | 14d | Mint metadata (decimals, supply, authorities) |
 | `circuit:trending` | ZSET | rolling | score = accumulated swap volume (SOL), member = mint |
 | `circuit:ph:{mint}` | LIST | 24h | Price history ring buffer (max 300 ticks) |
 | `circuit:candles:1m:{mint}` | LIST | 4h | 1m OHLCV ring buffer (max 120, ~2h) |
 | `circuit:candles:5m:{mint}` | LIST | 36h | 5m OHLCV ring buffer (max 288, ~24h) |
 | `circuit:candles:1h:{mint}` | LIST | 8d | 1h OHLCV ring buffer (max 168, ~7d) |
 | `circuit:candles:1d:{mint}` | LIST | 92d | 1d OHLCV ring buffer (max 90, ~90d) |
+| `circuit:vault-registry` | HASH | persist | Pool-vault registry — mirrored to Redis, rehydrated on startup, idle-pruned |
+| `circuit:price:SOL` | STRING | — | Self-derived SOL/USD oracle (from the on-chain SOL/USDC pool) |
 
 ---
 
 ## Postgres schema
 
-Three tables are created automatically on first run:
+Three tables are created automatically on first run (`writers/postgres.js`):
 
-**`pools`** — pool state snapshots (Raydium, Orca)
+**`pools`** — pool registration snapshots (Raydium AMM/CLMM + Orca; CPMM/PumpSwap/Pump.fun write to Redis only)
 ```sql
-id, pubkey, program, type, mint0, mint1, price,
-reserve0, reserve1, fee, slot, ts
+pool_account, pool_type, mint_a, mint_b, program,
+fee_rate, tick_spacing, first_seen_slot, first_seen_at
 ```
 
 **`tokens`** — token mint records
 ```sql
-mint, decimals, supply, mint_authority, freeze_authority,
-is_token2022, slot, ts
+mint, symbol, name, decimals, token_program,
+mint_authority, freeze_authority, supply,
+first_seen_slot, first_seen_at, updated_at
 ```
 
-**`candles`** — OHLCV candles (1m aggregation, written at interval close)
+**`ohlcv_candles`** — OHLCV candles, all four timeframes (`tf`), batch-flushed
 ```sql
-mint, interval, open_ts, close_ts,
-open, high, low, close, volume, trades
+time, mint, tf, open, high, low, close,
+volume, ticks, buys, sells
 ```
 
 ---
 
 ## Supported DEXes
 
-| DEX | Program | Parser |
-|---|---|---|
-| Raydium AMM v4 | `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` | `parsers/raydium.js` |
-| Raydium CLMM | `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK` | `parsers/raydium.js` |
-| Orca Whirlpools | `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` | `parsers/orca.js` |
-| PumpSwap | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | `parsers/pumpswap.js` |
+| DEX | Program | Parser | Subscribed (gRPC) |
+|---|---|---|---|
+| Raydium CLMM | `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK` | `parsers/raydium.js` | ✅ |
+| Raydium CPMM | `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` | `parsers/cpmm.js` | ✅ (vault deltas) |
+| Orca Whirlpools | `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` | `parsers/orca.js` | ✅ |
+| PumpSwap | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | `parsers/pumpswap.js` | ✅ (vault deltas) |
+| Pump.fun bonding curve | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | `parsers/pumpfun.js` | ✅ (writes `circuit:pool` only) |
+| Raydium AMM v4 | `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` | `parsers/raydium.js` | ⚠️ parser present, not subscribed |
 
-Additional DEX parsers can be added by implementing the `processAccountEvent(event)` interface in `parsers/`.
+Meteora DLMM was removed from the gRPC subscription. Add a DEX parser by implementing the `processAccountEvent(event)` interface in `parsers/`.
 
 ---
 
@@ -288,8 +297,9 @@ WantedBy=default.target
 
 - [circuit-geyser](https://github.com/Circuit-LLM/circuit-geyser) — Agave validator Geyser plugin
 - **circuit-indexer** — this repo, the stream consumer and data writer
-- [circuit-node](https://github.com/Circuit-LLM/circuit-node) — RPC aggregator + data API
-- [circuit-agent](https://github.com/Circuit-LLM/circuit-agent) — autonomous trading agent
+- [circuit-price-feed](https://github.com/Circuit-LLM/circuit-price-feed) — reads this Redis to serve real-time prices/candles
+- [circuit-node](https://github.com/Circuit-LLM/circuit-node) — RPC pool + on-chain data engine (reads this Redis)
+- [circuit-data-api](https://github.com/Circuit-LLM/circuit-data-api) — the public x402-gated data surface
 - [circuitllm.xyz](https://circuitllm.xyz) — website and data terminal
 
 ---
