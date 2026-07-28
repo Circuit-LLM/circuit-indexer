@@ -69,6 +69,46 @@ function parseListState(buf) {
   } catch { return null; }
 }
 
+// ── BidState (collection bids) ────────────────────────────────────────────────
+// BidState account (426 bytes fixed, VERIFIED live 2026-07-28). We keep ONLY collection-wide bids
+// (target == 1 / Whitelist), where targetId IS the collection — so no metadata lookup is ever needed.
+// Fields after targetId are borsh Options (field, fieldId), so the price offset is VARIABLE and must
+// be walked, not hard-coded. Used by the reconciliation only (bids are gPA-snapshotted off-Helius; not
+// subscribed on the firehose), so this adds zero gRPC egress.
+//   [0-7] disc  [10-41] owner=bidder  [74] target(1=Whitelist)  [75-106] targetId=collection
+//   [107] field Opt<Field>(1+1)  fieldId Opt<pk>(1+32)  quantity u32  filledQuantity u32  amount u64  currency Opt<pk>
+const BID_DISC = Buffer.from('9bc50561bd3c08b7', 'hex');
+const BID_SIZE = 426;
+
+function parseBidState(buf) {
+  if (buf.length < 130) return null;
+  try {
+    if (!buf.slice(0, 8).equals(BID_DISC)) return null;
+    if (buf[74] !== 1) return null;                         // collection (Whitelist) bids only
+    const collection = bs58.encode(buf.slice(75, 107));
+    const bidder     = bs58.encode(buf.slice(10, 42));
+    if (collection === SYSTEM_ADDR) return null;
+
+    let off = 107;
+    if (buf[off++]) off += 1;                               // field    Option<Field>  (+1 if Some)
+    if (buf[off++]) off += 32;                              // fieldId  Option<pubkey> (+32 if Some)
+    off += 8;                                               // quantity u32 + filledQuantity u32
+    if (buf.length < off + 9) return null;
+    const priceLamports = buf.readBigUInt64LE(off); off += 8;
+    if (priceLamports <= 0n) return null;
+    const native = buf[off] === 0;                          // currency Option: None = native SOL
+
+    return {
+      type: 'nft-bid',
+      collection,
+      bidder,
+      priceLamports: priceLamports.toString(),
+      priceSol: native ? Number(priceLamports) / 1e9 : null,
+      native,
+    };
+  } catch { return null; }
+}
+
 function processAccountEvent(event) {
   if (event.type !== 'account') return null;
   if (event.owner !== TENSOR_PROGRAM) return null;
@@ -85,6 +125,6 @@ function processAccountEvent(event) {
 }
 
 module.exports = {
-  processAccountEvent, parseListState,
-  TENSOR_PROGRAM, LIST_DISC, LIST_SIZE, OFFSETS,
+  processAccountEvent, parseListState, parseBidState,
+  TENSOR_PROGRAM, LIST_DISC, LIST_SIZE, BID_DISC, BID_SIZE, OFFSETS,
 };

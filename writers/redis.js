@@ -20,6 +20,7 @@
 //   circuit:nft:mint-collection:{mint} STRING  collection key (or '-' = none), TTL 30d (immutable; resolved off-Helius)
 //   circuit:nft:listings:{collection}  ZSET    score=priceSol member=assetId (native listings; rebuilt each reconcile)
 //   circuit:nft:floor:{collection}     STRING  JSON { collection, floorSol, listed, ts }
+//   circuit:nft:bids:{collection}      ZSET    score=priceSol member=bidState (collection-wide bids; top = ZREVRANGE 0 0)
 //
 // Requires Redis ≥ 6.2. Install: sudo apt-get install -y redis-server
 // This module is a no-op if Redis is not available.
@@ -365,6 +366,29 @@ async function getCachedMintCollections(mints) {
   return out;
 }
 
+// whitelist → voc (collection mint) cache. Immutable; '-' sentinel = no voc (merkle/fvc whitelist).
+// circuit:nft:wl-voc:{whitelist}
+async function cacheWhitelistVoc(whitelist, voc) {
+  const r = await getClient();
+  if (!r) return;
+  try { await r.setex(`circuit:nft:wl-voc:${whitelist}`, NFT_MINT_COLL_TTL, voc || '-'); } catch {}
+}
+
+async function getCachedWhitelistVocs(whitelists) {
+  const out = new Map();
+  const r = await getClient();
+  if (!r) { whitelists.forEach(w => out.set(w, undefined)); return out; }
+  try {
+    const CHUNK = 5000;
+    for (let i = 0; i < whitelists.length; i += CHUNK) {
+      const slice = whitelists.slice(i, i + CHUNK);
+      const vals = await r.mget(...slice.map(w => `circuit:nft:wl-voc:${w}`));
+      slice.forEach((w, j) => out.set(w, vals[j] === null ? undefined : vals[j]));
+    }
+  } catch { whitelists.forEach(w => { if (!out.has(w)) out.set(w, undefined); }); }
+  return out;
+}
+
 // Rebuild the per-collection listing ZSETs + floor snapshots from the reconciliation snapshot.
 //   collectionMap: Map(collection → [{ assetId, priceSol }])   (native-SOL listings only)
 // circuit:nft:listings:{collection}  ZSET  score=priceSol member=assetId
@@ -400,6 +424,35 @@ async function rebuildNftCollections(collectionMap) {
     for (const gone of existing) { pipe.del(`circuit:nft:listings:${gone}`); pipe.del(`circuit:nft:floor:${gone}`); }
     await pipe.exec();
   } catch (e) { Logger.warn('rebuildNftCollections failed', { error: e.message }); }
+}
+
+// Rebuild per-collection BID ZSETs from the reconciliation snapshot (collection-wide bids only).
+//   bidMap: Map(collection → [{ bidState, priceSol }])   (native-SOL bids)
+// circuit:nft:bids:{collection}  ZSET  score=priceSol member=bidState  (top bid = ZREVRANGE 0 0)
+async function rebuildNftBids(bidMap) {
+  const r = await getClient();
+  if (!r) return;
+  try {
+    const existing = new Set();
+    let cur = '0';
+    do {
+      const [next, batch] = await r.scan(cur, 'MATCH', 'circuit:nft:bids:*', 'COUNT', 1000);
+      cur = next;
+      for (const k of batch) existing.add(k.slice('circuit:nft:bids:'.length));
+    } while (cur !== '0');
+
+    const pipe = r.pipeline();
+    for (const [collection, items] of bidMap) {
+      const key = `circuit:nft:bids:${collection}`;
+      pipe.del(key);
+      const args = [];
+      for (const it of items) args.push(it.priceSol, it.bidState);
+      if (args.length) pipe.zadd(key, ...args);
+      existing.delete(collection);
+    }
+    for (const gone of existing) pipe.del(`circuit:nft:bids:${gone}`);
+    await pipe.exec();
+  } catch (e) { Logger.warn('rebuildNftBids failed', { error: e.message }); }
 }
 
 // ── Vault registry persistence ──────────────────────────────────────────────────
@@ -442,6 +495,7 @@ module.exports = {
   saveVaultEntry, loadVaultRegistry, removeVaultEntries,
   writeNftListing, getNftListing, removeNftListing,
   writeNftListingsBatch, removeNftListingsBatch,
-  cacheMintCollection, getCachedMintCollection, getCachedMintCollections, rebuildNftCollections,
+  cacheMintCollection, getCachedMintCollection, getCachedMintCollections, rebuildNftCollections, rebuildNftBids,
+  cacheWhitelistVoc, getCachedWhitelistVocs,
   disconnect,
 };
