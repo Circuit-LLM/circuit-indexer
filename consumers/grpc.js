@@ -169,6 +169,19 @@ class GrpcConsumer {
       orca:     { account: [], owner: ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'],  filters: [{ datasize: 653 }] },
       pumpswap: { account: [], owner: ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'], filters: [{ datasize: 301 }] },
     };
+    // Tensor NFT marketplace listings — OPT-IN (CIRCUIT_NFT=1), one-flag rollback like CIRCUIT_NARROW.
+    // Scoped by the exact 317-byte ListState size (same mechanism as the pool groups above) — that
+    // alone keeps us to single-NFT listing accounts, and parsers/nft-tensor.js enforces the 8-byte
+    // Anchor discriminator on the receiving side so any other 317-byte account is dropped for free.
+    // (Yellowstone's gRPC memcmp wire-format differs from JSON-RPC and silently matched nothing, so
+    // discriminator filtering is done in-parser, not in the subscription.) NFT listing churn is a
+    // small fraction of the token/DEX stream; measure the exact egress delta with CIRCUIT_COST_PROBE=1.
+    if (process.env.CIRCUIT_NFT === '1') {
+      accounts.nftTensor = {
+        account: [], owner: ['TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp'],
+        filters: [{ datasize: 317 }],
+      };
+    }
     if (this._narrow) {
       // CPMM + Pump.fun pool states stay (they populate the vault registry). Replace the unfiltered
       // Token/Token-2022 owner with: (a) the specific registered VAULTS — exactly what produces prices

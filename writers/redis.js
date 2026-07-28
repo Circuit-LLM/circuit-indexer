@@ -15,6 +15,11 @@
 //   circuit:candles:1d:{mint}     LIST    1d OHLCV ring buffer, max 90 candles (~90d), TTL 92d
 //                                         each entry: JSON {t, o, h, l, c, v, n, b, s}
 //                                           t=openTime ms, o/h/l/c=OHLCV, n=ticks, b=buys, s=sells
+//   circuit:nft:listing:{assetId} STRING  JSON Tensor listing {priceSol,priceLamports,seller,listState,native}, TTL 2h
+//                                         (firehose delta; hourly gPA reconciliation is authoritative — CIRCUIT_NFT=1)
+//   circuit:nft:mint-collection:{mint} STRING  collection key (or '-' = none), TTL 30d (immutable; resolved off-Helius)
+//   circuit:nft:listings:{collection}  ZSET    score=priceSol member=assetId (native listings; rebuilt each reconcile)
+//   circuit:nft:floor:{collection}     STRING  JSON { collection, floorSol, listed, ts }
 //
 // Requires Redis ≥ 6.2. Install: sudo apt-get install -y redis-server
 // This module is a no-op if Redis is not available.
@@ -260,6 +265,143 @@ async function disconnect() {
   if (_client) { await _client.quit(); _client = null; }
 }
 
+// ── NFT listings (Tensor marketplace) ───────────────────────────────────────────
+// Two-channel model (see parsers/nft-tensor.js):
+//   • firehose delta — writeNftListing() on every ListState create/reprice (this file, real-time)
+//   • hourly reconciliation — a full off-Helius gPA snapshot rebuilds the authoritative set,
+//     refreshes TTLs, and expires sold/delisted accounts (Anchor `close` flips the owner, so the
+//     stream can't observe the removal). Reconciliation also resolves assetId→collection.
+// Per-asset record TTL is generous so a still-open (un-repriced) listing survives between hourly
+// snapshots; the snapshot refreshes it. Collection floor bucketing lives in circuit:nft:listings:{collection}
+// (a ZSET, score=priceSol) written once collection is resolvable — added with the reconciliation pass.
+const NFT_LISTING_TTL = 2 * 3600; // seconds (2h — comfortably spans the hourly reconciliation)
+
+// Per-asset listing record. assetId → {priceSol, priceLamports, seller, listState, native, ts}
+async function writeNftListing(assetId, rec) {
+  const r = await getClient();
+  if (!r) return;
+  await r.setex(`circuit:nft:listing:${assetId}`, NFT_LISTING_TTL, JSON.stringify({ ...rec, ts: Date.now() }));
+}
+
+async function getNftListing(assetId) {
+  const r = await getClient();
+  if (!r) return null;
+  try { const j = await r.get(`circuit:nft:listing:${assetId}`); return j ? JSON.parse(j) : null; }
+  catch { return null; }
+}
+
+// Batched per-asset writes for the reconciliation snapshot (pipelined — one round-trip per chunk,
+// not one per listing). records: [{ assetId, rec }]
+async function writeNftListingsBatch(records) {
+  const r = await getClient();
+  if (!r) return;
+  try {
+    const CHUNK = 5000;
+    for (let i = 0; i < records.length; i += CHUNK) {
+      const pipe = r.pipeline();
+      for (const { assetId, rec } of records.slice(i, i + CHUNK)) {
+        pipe.setex(`circuit:nft:listing:${assetId}`, NFT_LISTING_TTL, JSON.stringify({ ...rec, ts: Date.now() }));
+      }
+      await pipe.exec();
+    }
+  } catch (e) { Logger.warn('writeNftListingsBatch failed', { error: e.message }); }
+}
+
+// Batched removals (expired listings).
+async function removeNftListingsBatch(assetIds) {
+  if (!assetIds || !assetIds.length) return;
+  const r = await getClient();
+  if (!r) return;
+  try {
+    const CHUNK = 5000;
+    for (let i = 0; i < assetIds.length; i += CHUNK) {
+      const pipe = r.pipeline();
+      for (const id of assetIds.slice(i, i + CHUNK)) pipe.del(`circuit:nft:listing:${id}`);
+      await pipe.exec();
+    }
+  } catch (e) { Logger.warn('removeNftListingsBatch failed', { error: e.message }); }
+}
+
+// Remove a listing (called by the reconciliation diff when an account is gone from the snapshot).
+async function removeNftListing(assetId) {
+  const r = await getClient();
+  if (!r) return;
+  try { await r.del(`circuit:nft:listing:${assetId}`); } catch {}
+}
+
+// mint → collection cache. Immutable membership, so a long TTL (refreshed by reconciliation) just
+// bounds the key class. `null` collection (not a regular NFT / no collection) is cached as the
+// sentinel '-' so we never re-resolve it. circuit:nft:mint-collection:{mint}
+const NFT_MINT_COLL_TTL = 30 * 86400;
+
+async function cacheMintCollection(mint, collection) {
+  const r = await getClient();
+  if (!r) return;
+  try { await r.setex(`circuit:nft:mint-collection:${mint}`, NFT_MINT_COLL_TTL, collection || '-'); } catch {}
+}
+
+async function getCachedMintCollection(mint) {
+  const r = await getClient();
+  if (!r) return undefined;                        // undefined = not cached; '-'/null-string handled by caller
+  try {
+    const v = await r.get(`circuit:nft:mint-collection:${mint}`);
+    return v === null ? undefined : v;             // '-' means resolved-to-none
+  } catch { return undefined; }
+}
+
+// Batched MGET variant for reconciliation. Returns Map(mint → cachedValue|undefined).
+async function getCachedMintCollections(mints) {
+  const out = new Map();
+  const r = await getClient();
+  if (!r) { mints.forEach(m => out.set(m, undefined)); return out; }
+  try {
+    const CHUNK = 5000;
+    for (let i = 0; i < mints.length; i += CHUNK) {
+      const slice = mints.slice(i, i + CHUNK);
+      const vals = await r.mget(...slice.map(m => `circuit:nft:mint-collection:${m}`));
+      slice.forEach((m, j) => out.set(m, vals[j] === null ? undefined : vals[j]));
+    }
+  } catch { mints.forEach(m => { if (!out.has(m)) out.set(m, undefined); }); }
+  return out;
+}
+
+// Rebuild the per-collection listing ZSETs + floor snapshots from the reconciliation snapshot.
+//   collectionMap: Map(collection → [{ assetId, priceSol }])   (native-SOL listings only)
+// circuit:nft:listings:{collection}  ZSET  score=priceSol member=assetId
+// circuit:nft:floor:{collection}     STRING JSON { collection, floorSol, listed, ts }
+// Collections present before but absent now are dropped, so the floor set stays accurate.
+async function rebuildNftCollections(collectionMap) {
+  const r = await getClient();
+  if (!r) return;
+  try {
+    // existing collection keys → drop any not in the new snapshot
+    const existing = new Set();
+    let cur = '0';
+    do {
+      const [next, batch] = await r.scan(cur, 'MATCH', 'circuit:nft:listings:*', 'COUNT', 1000);
+      cur = next;
+      for (const k of batch) existing.add(k.slice('circuit:nft:listings:'.length));
+    } while (cur !== '0');
+
+    const pipe = r.pipeline();
+    for (const [collection, items] of collectionMap) {
+      const key = `circuit:nft:listings:${collection}`;
+      pipe.del(key);
+      // ZADD in one shot: [score, member, score, member, ...]
+      const args = [];
+      let floor = Infinity;
+      for (const it of items) { args.push(it.priceSol, it.assetId); if (it.priceSol < floor) floor = it.priceSol; }
+      if (args.length) pipe.zadd(key, ...args);
+      pipe.set(`circuit:nft:floor:${collection}`,
+        JSON.stringify({ collection, floorSol: floor === Infinity ? null : floor, listed: items.length, ts: Date.now() }));
+      existing.delete(collection);
+    }
+    // stale collections (had listings, none now)
+    for (const gone of existing) { pipe.del(`circuit:nft:listings:${gone}`); pipe.del(`circuit:nft:floor:${gone}`); }
+    await pipe.exec();
+  } catch (e) { Logger.warn('rebuildNftCollections failed', { error: e.message }); }
+}
+
 // ── Vault registry persistence ──────────────────────────────────────────────────
 // The in-memory vaultRegistry rebuilds from ~zero over ~1.5h after a restart (CPMM/PumpSwap pool-state
 // accounts stream slowly), degrading pricing + discovery coverage for that whole window. Mirror it to a
@@ -298,5 +440,8 @@ module.exports = {
   getPrice, getPriceSol, getPool, getPoolByMint, getMint,
   getTrending, getPriceHistory, getCandles,
   saveVaultEntry, loadVaultRegistry, removeVaultEntries,
+  writeNftListing, getNftListing, removeNftListing,
+  writeNftListingsBatch, removeNftListingsBatch,
+  cacheMintCollection, getCachedMintCollection, getCachedMintCollections, rebuildNftCollections,
   disconnect,
 };

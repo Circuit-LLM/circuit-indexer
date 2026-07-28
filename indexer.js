@@ -28,6 +28,8 @@ const cpmm       = require('./parsers/cpmm');
 const pumpswap   = require('./parsers/pumpswap');
 const pumpfun    = require('./parsers/pumpfun');
 const token      = require('./parsers/token');
+const nftTensor  = require('./parsers/nft-tensor');
+const nftReconcile = require('./lib/nft-reconcile');
 const redis      = require('./writers/redis');
 const postgres   = require('./writers/postgres');
 
@@ -555,6 +557,23 @@ async function handleAccount(event) {
     return;
   }
 
+  // ── Try Tensor NFT listing (ListState) ────────────────────────────────────
+  // Firehose delta channel: writes the per-asset listing record. Collection floor
+  // bucketing + sold/delisted expiry come from the hourly gPA reconciliation
+  // (Anchor `close` flips the owner, so the stream can't observe removals). No RPC here.
+  const nftListing = nftTensor.processAccountEvent(event);
+  if (nftListing) {
+    stats.pools++;  // reuse the pools counter for indexed-record throughput
+    await redis.writeNftListing(nftListing.assetId, {
+      priceLamports: nftListing.priceLamports,
+      priceSol:      nftListing.priceSol,
+      seller:        nftListing.seller,
+      listState:     nftListing.listState,
+      native:        nftListing.native,
+    });
+    return;
+  }
+
   // ── Try token mint ────────────────────────────────────────────────────────
   const mintInfo = token.processAccountEvent(event);
   if (mintInfo) {
@@ -740,4 +759,8 @@ process.on('SIGINT',  () => shutdown('SIGINT'));
     Logger.warn('vault registry rehydrate failed — will rebuild from stream', { error: e.message });
   }
   startConsumer();
+
+  // NFT listing reconciliation — the authoritative full-stock snapshot + collection floors.
+  // Off-Helius (Triton), throttled backlog. Only runs with the feature flag on.
+  if (process.env.CIRCUIT_NFT === '1') nftReconcile.start();
 })();
