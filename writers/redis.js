@@ -21,6 +21,7 @@
 //   circuit:nft:listings:{collection}  ZSET    score=priceSol member=assetId (native listings; rebuilt each reconcile)
 //   circuit:nft:floor:{collection}     STRING  JSON { collection, floorSol, listed, ts }
 //   circuit:nft:bids:{collection}      ZSET    score=priceSol member=bidState (collection-wide bids; top = ZREVRANGE 0 0)
+//   circuit:nft:coll-name:{collection} STRING  collection human name (or '-'), 30d TTL (for name search)
 //
 // Requires Redis ≥ 6.2. Install: sudo apt-get install -y redis-server
 // This module is a no-op if Redis is not available.
@@ -366,6 +367,29 @@ async function getCachedMintCollections(mints) {
   return out;
 }
 
+// collection → human name cache (from the collection NFT's metadata). '-' = unresolved.
+// circuit:nft:coll-name:{collection}
+async function cacheCollName(collection, name) {
+  const r = await getClient();
+  if (!r) return;
+  try { await r.setex(`circuit:nft:coll-name:${collection}`, NFT_MINT_COLL_TTL, name || '-'); } catch {}
+}
+
+async function getCachedCollNames(collections) {
+  const out = new Map();
+  const r = await getClient();
+  if (!r) { collections.forEach((c) => out.set(c, undefined)); return out; }
+  try {
+    const CHUNK = 5000;
+    for (let i = 0; i < collections.length; i += CHUNK) {
+      const slice = collections.slice(i, i + CHUNK);
+      const vals = await r.mget(...slice.map((c) => `circuit:nft:coll-name:${c}`));
+      slice.forEach((c, j) => out.set(c, vals[j] === null ? undefined : vals[j]));
+    }
+  } catch { collections.forEach((c) => { if (!out.has(c)) out.set(c, undefined); }); }
+  return out;
+}
+
 // whitelist → voc (collection mint) cache. Immutable; '-' sentinel = no voc (merkle/fvc whitelist).
 // circuit:nft:wl-voc:{whitelist}
 async function cacheWhitelistVoc(whitelist, voc) {
@@ -497,5 +521,6 @@ module.exports = {
   writeNftListingsBatch, removeNftListingsBatch,
   cacheMintCollection, getCachedMintCollection, getCachedMintCollections, rebuildNftCollections, rebuildNftBids,
   cacheWhitelistVoc, getCachedWhitelistVocs,
+  cacheCollName, getCachedCollNames,
   disconnect,
 };
