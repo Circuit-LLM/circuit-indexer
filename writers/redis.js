@@ -23,6 +23,7 @@
 //   circuit:nft:bids:{collection}      ZSET    score=priceSol member=bidState (collection-wide bids; top = ZREVRANGE 0 0)
 //   circuit:nft:coll-name:{collection} STRING  collection human name (or '-'), 30d TTL (for name search)
 //   circuit:nft:royalty:{collection}   STRING  seller-fee basis points (or '-'), 30d TTL (net-spread math)
+//   circuit:nft:sales:{collection}     LIST    recent sales (newest first) JSON {assetId,priceSol,buyer,sig,ts}, max 100, 7d TTL
 //
 // Requires Redis ≥ 6.2. Install: sudo apt-get install -y redis-server
 // This module is a no-op if Redis is not available.
@@ -325,6 +326,39 @@ async function removeNftListingsBatch(assetIds) {
   } catch (e) { Logger.warn('removeNftListingsBatch failed', { error: e.message }); }
 }
 
+// Recent sales ring buffer per collection (newest first), written by the TCMP tx-stream sale detector.
+// circuit:nft:sales:{collection}  LIST of JSON { assetId, priceSol, buyer, sig, ts }, max 100, 7d TTL.
+const NFT_SALES_MAX = 100;
+const NFT_SALES_TTL = 7 * 86400;
+async function writeNftSale(collection, sale) {
+  const r = await getClient();
+  if (!r) return;
+  try {
+    const key = `circuit:nft:sales:${collection}`;
+    const pipe = r.pipeline();
+    pipe.lpush(key, JSON.stringify(sale));
+    pipe.ltrim(key, 0, NFT_SALES_MAX - 1);
+    pipe.expire(key, NFT_SALES_TTL);
+    await pipe.exec();
+  } catch {}
+}
+
+// Batched read of per-asset listing records (for capturing removed listings' last price). Map(assetId → rec).
+async function getNftListingsBatch(assetIds) {
+  const out = new Map();
+  const r = await getClient();
+  if (!r || !assetIds.length) return out;
+  try {
+    const CHUNK = 5000;
+    for (let i = 0; i < assetIds.length; i += CHUNK) {
+      const slice = assetIds.slice(i, i + CHUNK);
+      const vals = await r.mget(...slice.map((a) => `circuit:nft:listing:${a}`));
+      slice.forEach((a, j) => { if (vals[j]) { try { out.set(a, JSON.parse(vals[j])); } catch {} } });
+    }
+  } catch {}
+  return out;
+}
+
 // Remove a listing (called by the reconciliation diff when an account is gone from the snapshot).
 async function removeNftListing(assetId) {
   const r = await getClient();
@@ -540,7 +574,7 @@ module.exports = {
   getPrice, getPriceSol, getPool, getPoolByMint, getMint,
   getTrending, getPriceHistory, getCandles,
   saveVaultEntry, loadVaultRegistry, removeVaultEntries,
-  writeNftListing, getNftListing, removeNftListing,
+  writeNftListing, getNftListing, getNftListingsBatch, removeNftListing, writeNftSale,
   writeNftListingsBatch, removeNftListingsBatch,
   cacheMintCollection, getCachedMintCollection, getCachedMintCollections, rebuildNftCollections, rebuildNftBids,
   cacheWhitelistVoc, getCachedWhitelistVocs,
