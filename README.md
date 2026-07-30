@@ -114,6 +114,9 @@ All configuration is via environment variables:
 | `CIRCUIT_NARROW` | `0` | gRPC consumer: narrow the account subscription to registered pool vaults + 82-byte mints instead of every SPL token account. Cuts ~⅔ of account-stream egress. See [Subscription scope](#subscription-scope-grpc-cost-control). |
 | `CIRCUIT_TX_WATCHLIST` | — | gRPC consumer: comma-separated pool addresses to receive the scoped transaction stream for (full-fidelity candles on low-volume pools). |
 | `CIRCUIT_COST_PROBE` | `0` | Log a periodic breakdown of account-stream bytes by kind (vault / mint / discarded holder). Diagnostic only; safe to leave off. |
+| `CIRCUIT_NFT` | `0` | Enable the Tensor NFT reconciler (`lib/nft-reconcile.js`) → Redis floors/listings/bids/royalties. **RPC cost lever** — see [NFT reconcile cost](#nft-reconcile-grpc-cost-control) below. |
+| `CIRCUIT_NFT_RECONCILE_SLOW_MS` | `1800000` (30 min) | Steady-state interval between full-Tensor reconcile passes (once the collection backlog is drained). Each pass = 2 `getProgramAccounts` scans of the whole Tensor program (~120k ListState + ~6.5k BidState). Raise it to cut RPC cost at the price of NFT-data freshness. |
+| `CIRCUIT_NFT_RECONCILE_FAST_MS` | `180000` (3 min) | Interval while the collection-resolution backlog is still draining. |
 
 ---
 
@@ -166,6 +169,22 @@ Set **`CIRCUIT_NARROW=1`** to replace that unfiltered subscription with a precis
 This cuts the account stream by ~⅔ (holder accounts are no longer received) with **no loss of priced tokens** — only vaults in the in-memory registry ever produced a price. Decimals for both mints of every pool are RPC-resolved at registration (so reverse-ordered pools price correctly), and `circuit:mint` metadata is back-filled from the same fetch for tokens the narrowed stream doesn't carry in-stream (e.g. token-2022 mints with extensions).
 
 `CIRCUIT_NARROW` is **off by default** — the subscription is byte-for-byte the legacy one until you set it, so it can be enabled in production and rolled back with a single flag flip + restart. Use `CIRCUIT_COST_PROBE=1` to log the before/after byte breakdown.
+
+### NFT reconcile (RPC cost control)
+
+The Tensor NFT data (`CIRCUIT_NFT=1`, `lib/nft-reconcile.js`) is **not** carried on the gRPC firehose —
+Tensor's program is not in the account subscription. It is refreshed entirely by a periodic
+**`getProgramAccounts`** snapshot: each pass makes two full-Tensor gPA scans (all ListState ~120k, all
+collection BidState ~6.5k), already trimmed with `dataSlice` so egress is modest (~1.7 GB/day). The cost is
+the **scan itself** — providers meter `getProgramAccounts` heavily because it walks the whole program's
+account index per call, regardless of `dataSlice`. So the cost lever here is **call frequency, not bytes**.
+
+Cadence: `CIRCUIT_NFT_RECONCILE_FAST_MS` while the collection-resolution backlog is draining, then
+`CIRCUIT_NFT_RECONCILE_SLOW_MS` at steady state. At the 30-min default that is ~96 full-Tensor gPA scans/day
+— enough to roughly double a Triton bill on its own. Widen `CIRCUIT_NFT_RECONCILE_SLOW_MS` (e.g. `7200000`
+= 2 h ⇒ ~4× fewer scans) to cut it; the only cost is NFT floor/bid staleness, which is fine because NFTs
+are illiquid and consumers verify listing state on-chain at action time. Leave `CIRCUIT_NFT` unset to disable
+the reconciler entirely (no NFT data, zero NFT RPC).
 
 ---
 
